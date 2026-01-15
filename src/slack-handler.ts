@@ -8,6 +8,9 @@ import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
 import { PermissionMCPServer } from './permission-mcp-server';
 import { config } from './config';
+import { TmuxManager } from './tmux-manager';
+import { MessageQueue, QueuedMessage } from './message-queue';
+import { parseSessionCommand, formatSessionInfo, SESSION_COMMANDS } from './session-commands';
 
 interface MessageEvent {
   user: string;
@@ -40,6 +43,8 @@ export class SlackHandler {
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botMessages: Map<string, string[]> = new Map(); // sessionKey -> array of bot message timestamps
   private botUserId: string | null = null;
+  private tmuxManager: TmuxManager;
+  private messageQueue: MessageQueue;
 
   constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -48,17 +53,19 @@ export class SlackHandler {
     this.workingDirManager = new WorkingDirectoryManager();
     this.fileHandler = new FileHandler();
     this.todoManager = new TodoManager();
+    this.tmuxManager = new TmuxManager();
+    this.messageQueue = new MessageQueue();
   }
 
   async handleMessage(event: MessageEvent, say: any) {
     const { user, channel, thread_ts, ts, text, files } = event;
-    
+
     // Process any attached files
     let processedFiles: ProcessedFile[] = [];
     if (files && files.length > 0) {
       this.logger.info('Processing uploaded files', { count: files.length });
       processedFiles = await this.fileHandler.downloadAndProcessFiles(files);
-      
+
       if (processedFiles.length > 0) {
         await say({
           text: `📎 Processing ${processedFiles.length} file(s): ${processedFiles.map(f => f.name).join(', ')}`,
@@ -70,6 +77,20 @@ export class SlackHandler {
     // If no text and no files, nothing to process
     if (!text && processedFiles.length === 0) return;
 
+    // Parse session commands
+    const command = parseSessionCommand(text || '');
+
+    // Handle session commands first
+    if (command.type === 'complete_delete' || command.type === 'complete_keep') {
+      await this.handleCompleteCommand(channel, thread_ts || ts, command.type === 'complete_delete', say);
+      return;
+    }
+
+    if (command.type === 'connect') {
+      await this.handleConnectCommand(channel, thread_ts || ts, command.sessionName!, say);
+      return;
+    }
+
     this.logger.debug('Received message from Slack', {
       user,
       channel,
@@ -79,8 +100,12 @@ export class SlackHandler {
       fileCount: processedFiles.length,
     });
 
+    // For messages in threads, use thread_ts as the thread identifier
+    // For new messages in channel, use ts as the thread identifier (starts a new thread)
+    const actualThreadTs = thread_ts || ts;
+
     // Check if this is a working directory command (only if there's text)
-    const setDirPath = text ? this.workingDirManager.parseSetCommand(text.trim()) : null;
+    const setDirPath = command.messageText ? this.workingDirManager.parseSetCommand(command.messageText.trim()) : null;
     if (setDirPath) {
       const isDM = channel.startsWith('D');
       const result = this.workingDirManager.setWorkingDirectory(
@@ -183,11 +208,27 @@ export class SlackHandler {
       
       await say({
         text: errorMessage,
-        thread_ts: thread_ts || ts,
+        thread_ts: actualThreadTs,
       });
       return;
     }
 
+    // NEW SESSION-BASED QUEUING SYSTEM
+    // If this is a threaded message (or becomes a thread), handle via queue
+    if (actualThreadTs) {
+      await this.enqueueAndProcessMessage(
+        user,
+        channel,
+        actualThreadTs,
+        command,
+        processedFiles,
+        workingDirectory,
+        say
+      );
+      return;
+    }
+
+    // OLD DIRECT PROCESSING (fallback for non-threaded messages)
     const sessionKey = this.claudeHandler.getSessionKey(user, channel, thread_ts || ts);
 
     // Store the original message info for status reactions
@@ -780,6 +821,390 @@ export class SlackHandler {
       .replace(/__([^_]+)__/g, '_$1_');
 
     return formatted;
+  }
+
+  private async enqueueAndProcessMessage(
+    user: string,
+    channel: string,
+    threadTs: string,
+    command: any,
+    processedFiles: ProcessedFile[],
+    workingDirectory: string,
+    say: any
+  ): Promise<void> {
+    // Get or create tmux session for this thread
+    let sessionName = this.tmuxManager.getSession(channel, threadTs);
+    const isNewSession = !sessionName;
+
+    if (!sessionName) {
+      sessionName = this.tmuxManager.createSession(channel, threadTs, workingDirectory);
+      this.logger.info('Created new tmux session for thread', { sessionName, threadTs });
+
+      // Announce the session
+      await say({
+        text: formatSessionInfo(sessionName),
+        thread_ts: threadTs,
+      });
+    }
+
+    // Handle interrupt
+    if (command.type === 'interrupt') {
+      this.logger.info('Interrupt received', { threadTs, sessionName });
+
+      // Abort current execution
+      const sessionKey = this.claudeHandler.getSessionKey(user, channel, threadTs);
+      const existingController = this.activeControllers.get(sessionKey);
+      if (existingController) {
+        existingController.abort();
+        this.logger.info('Aborted current execution', { sessionKey });
+      }
+
+      // Enqueue the interrupt message (which clears the queue)
+      this.messageQueue.enqueue(channel, threadTs, {
+        text: command.messageText,
+        files: processedFiles,
+        timestamp: Date.now(),
+        isInterrupt: true,
+      });
+
+      await say({
+        text: `🛑 *Interrupted*\nProcessing new message: ${command.messageText.substring(0, 100)}${command.messageText.length > 100 ? '...' : ''}`,
+        thread_ts: threadTs,
+      });
+    } else {
+      // Enqueue normal message
+      this.messageQueue.enqueue(channel, threadTs, {
+        text: command.messageText,
+        files: processedFiles,
+        timestamp: Date.now(),
+        isInterrupt: false,
+      });
+
+      const queueSize = this.messageQueue.getQueueSize(channel, threadTs);
+      if (queueSize > 1) {
+        await say({
+          text: `📬 Message queued (${queueSize} messages in queue)`,
+          thread_ts: threadTs,
+        });
+      }
+    }
+
+    // Start processing if not already processing
+    if (!this.messageQueue.isProcessing(channel, threadTs)) {
+      await this.processMessageQueue(user, channel, threadTs, workingDirectory, say);
+    }
+  }
+
+  private async processMessageQueue(
+    user: string,
+    channel: string,
+    threadTs: string,
+    workingDirectory: string,
+    say: any
+  ): Promise<void> {
+    this.messageQueue.setProcessing(channel, threadTs, true);
+
+    try {
+      while (this.messageQueue.hasMessages(channel, threadTs)) {
+        const queuedMessage = this.messageQueue.dequeue(channel, threadTs);
+        if (!queuedMessage) break;
+
+        this.logger.info('Processing queued message', { threadTs, remaining: this.messageQueue.getQueueSize(channel, threadTs) });
+
+        // Process this message using existing Claude handler logic
+        await this.processClaudeMessage(
+          user,
+          channel,
+          threadTs,
+          queuedMessage.text,
+          queuedMessage.files || [],
+          workingDirectory,
+          say
+        );
+      }
+    } finally {
+      this.messageQueue.setProcessing(channel, threadTs, false);
+    }
+  }
+
+  private async processClaudeMessage(
+    user: string,
+    channel: string,
+    threadTs: string,
+    text: string,
+    processedFiles: ProcessedFile[],
+    workingDirectory: string,
+    say: any
+  ): Promise<void> {
+    // This is the core Claude processing logic extracted from the original handleMessage
+    // For now, I'll just put a placeholder and we can fill it in
+    const sessionKey = this.claudeHandler.getSessionKey(user, channel, threadTs);
+
+    const abortController = new AbortController();
+    this.activeControllers.set(sessionKey, abortController);
+
+    let session = this.claudeHandler.getSession(user, channel, threadTs);
+    if (!session) {
+      this.logger.debug('Creating new session', { sessionKey });
+      session = this.claudeHandler.createSession(user, channel, threadTs);
+    } else {
+      this.logger.debug('Using existing session', { sessionKey, sessionId: session.sessionId });
+    }
+
+    let currentMessages: string[] = [];
+    let statusMessageTs: string | undefined;
+
+    try {
+      // Prepare the prompt with file attachments
+      const finalPrompt = processedFiles.length > 0
+        ? await this.fileHandler.formatFilePrompt(processedFiles, text || '')
+        : text || '';
+
+      this.logger.info('Sending query to Claude Code SDK', {
+        prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''),
+        sessionId: session.sessionId,
+        workingDirectory,
+        fileCount: processedFiles.length,
+      });
+
+      // Send initial status message
+      const statusResult = await say({
+        text: '🤔 *Thinking...*',
+        thread_ts: threadTs,
+      });
+      statusMessageTs = statusResult.ts;
+
+      // Create Slack context for permission prompts
+      const slackContext = {
+        channel,
+        threadTs: threadTs,
+        user
+      };
+
+      for await (const message of this.claudeHandler.streamQuery(finalPrompt, session, abortController, workingDirectory, slackContext)) {
+        if (abortController.signal.aborted) break;
+
+        this.logger.debug('Received message from Claude SDK', {
+          type: message.type,
+          subtype: (message as any).subtype,
+          message: message,
+        });
+
+        if (message.type === 'assistant') {
+          // Check if this is a tool use message
+          const hasToolUse = message.message.content?.some((part: any) => part.type === 'tool_use');
+
+          if (hasToolUse) {
+            // Update status to show working
+            if (statusMessageTs) {
+              await this.app.client.chat.update({
+                channel,
+                ts: statusMessageTs,
+                text: '⚙️ *Working...*',
+              });
+            }
+
+            // Check for TodoWrite tool and handle it specially
+            const todoTool = message.message.content?.find((part: any) =>
+              part.type === 'tool_use' && part.name === 'TodoWrite'
+            );
+
+            if (todoTool) {
+              await this.handleTodoUpdate(todoTool.input, sessionKey, session?.sessionId, channel, threadTs, say);
+            }
+
+            // For other tool use messages, format them immediately as new messages
+            const toolContent = this.formatToolUse(message.message.content);
+            if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
+              await say({
+                text: toolContent,
+                thread_ts: threadTs,
+              });
+            }
+          } else {
+            // Handle regular text content
+            const content = this.extractTextContent(message);
+            if (content) {
+              currentMessages.push(content);
+
+              // Send each new piece of content as a separate message
+              const formatted = this.formatMessage(content, false);
+              await say({
+                text: formatted,
+                thread_ts: threadTs,
+              });
+            }
+          }
+        } else if (message.type === 'result') {
+          this.logger.info('Received result from Claude SDK', {
+            subtype: message.subtype,
+            hasResult: message.subtype === 'success' && !!(message as any).result,
+            totalCost: (message as any).total_cost_usd,
+            duration: (message as any).duration_ms,
+          });
+
+          if (message.subtype === 'success' && (message as any).result) {
+            const finalResult = (message as any).result;
+            if (finalResult && !currentMessages.includes(finalResult)) {
+              const formatted = this.formatMessage(finalResult, true);
+              await say({
+                text: formatted,
+                thread_ts: threadTs,
+              });
+            }
+          }
+        }
+      }
+
+      // Update status to completed
+      if (statusMessageTs) {
+        await this.app.client.chat.update({
+          channel,
+          ts: statusMessageTs,
+          text: '✅ *Task completed*',
+        });
+      }
+
+      this.logger.info('Completed processing message', {
+        sessionKey,
+        messageCount: currentMessages.length,
+      });
+
+      // Clean up temporary files
+      if (processedFiles.length > 0) {
+        await this.fileHandler.cleanupTempFiles(processedFiles);
+      }
+    } catch (error: any) {
+      if (error.name !== 'AbortError') {
+        this.logger.error('Error handling message', error);
+
+        // Update status to error
+        if (statusMessageTs) {
+          await this.app.client.chat.update({
+            channel,
+            ts: statusMessageTs,
+            text: '❌ *Error occurred*',
+          });
+        }
+
+        await say({
+          text: `Error: ${error.message || 'Something went wrong'}`,
+          thread_ts: threadTs,
+        });
+      } else {
+        this.logger.debug('Request was aborted', { sessionKey });
+
+        // Update status to cancelled
+        if (statusMessageTs) {
+          await this.app.client.chat.update({
+            channel,
+            ts: statusMessageTs,
+            text: '⏹️ *Cancelled*',
+          });
+        }
+      }
+
+      // Clean up temporary files in case of error too
+      if (processedFiles.length > 0) {
+        await this.fileHandler.cleanupTempFiles(processedFiles);
+      }
+    } finally {
+      this.activeControllers.delete(sessionKey);
+    }
+  }
+
+  private async handleCompleteCommand(channel: string, threadTs: string, deleteThread: boolean, say: any): Promise<void> {
+    const sessionName = this.tmuxManager.getSession(channel, threadTs);
+
+    if (!sessionName) {
+      await say({
+        text: '❌ No active session found for this thread.',
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Close the tmux session
+    this.tmuxManager.closeSession(sessionName);
+
+    // Clear the message queue
+    this.messageQueue.clearQueue(channel, threadTs);
+
+    // Remove from active controllers
+    const sessionKey = this.claudeHandler.getSessionKey('', channel, threadTs);
+    this.activeControllers.delete(sessionKey);
+
+    if (deleteThread) {
+      // Delete all messages in the thread
+      await say({
+        text: `🗑️ Session \`${sessionName}\` closed. Deleting thread...`,
+        thread_ts: threadTs,
+      });
+
+      // Get all messages in thread and delete them
+      try {
+        const result = await this.app.client.conversations.replies({
+          channel,
+          ts: threadTs,
+        });
+
+        if (result.messages) {
+          for (const msg of result.messages) {
+            try {
+              await this.app.client.chat.delete({
+                channel,
+                ts: msg.ts!,
+              });
+            } catch (err) {
+              this.logger.debug('Failed to delete message', { ts: msg.ts, error: (err as Error).message });
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.error('Failed to delete thread', error);
+      }
+    } else {
+      await say({
+        text: `✅ Session \`${sessionName}\` closed. Thread preserved.`,
+        thread_ts: threadTs,
+      });
+    }
+
+    this.logger.info('Session completed', { sessionName, deleteThread });
+  }
+
+  private async handleConnectCommand(channel: string, threadTs: string, sessionName: string, say: any): Promise<void> {
+    if (!sessionName) {
+      await say({
+        text: `❌ Please provide a session name: ${SESSION_COMMANDS.CONNECT} session_name`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    if (!this.tmuxManager.connectToSession(sessionName)) {
+      await say({
+        text: `❌ Session \`${sessionName}\` not found. Available sessions:\n${this.formatAvailableSessions()}`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    await say({
+      text: formatSessionInfo(sessionName),
+      thread_ts: threadTs,
+    });
+
+    this.logger.info('Connected to existing session', { sessionName, threadTs });
+  }
+
+  private formatAvailableSessions(): string {
+    const sessions = this.tmuxManager.getAllSessions();
+    if (sessions.length === 0) {
+      return '_No active sessions_';
+    }
+
+    return sessions.map(s => `• \`${s.sessionName}\``).join('\n');
   }
 
   setupEventHandlers() {
