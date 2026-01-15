@@ -38,6 +38,7 @@ export class SlackHandler {
   private todoMessages: Map<string, string> = new Map(); // sessionKey -> messageTs
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
+  private botMessages: Map<string, string[]> = new Map(); // sessionKey -> array of bot message timestamps
   private botUserId: string | null = null;
 
   constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
@@ -210,6 +211,25 @@ export class SlackHandler {
       existingController.abort();
     }
 
+    // Delete all previous bot messages from the last task to keep the channel clean
+    const previousMessages = this.botMessages.get(sessionKey);
+    if (previousMessages && previousMessages.length > 0) {
+      this.logger.info('Deleting previous bot messages', { sessionKey, count: previousMessages.length });
+      for (const messageTs of previousMessages) {
+        try {
+          await this.app.client.chat.delete({
+            channel,
+            ts: messageTs,
+          });
+        } catch (error) {
+          this.logger.debug('Failed to delete previous message', { messageTs, error: (error as any).message });
+        }
+      }
+    }
+
+    // Clear previous message tracking for this session
+    this.botMessages.set(sessionKey, []);
+
     const abortController = new AbortController();
     this.activeControllers.set(sessionKey, abortController);
 
@@ -243,6 +263,13 @@ export class SlackHandler {
         thread_ts: thread_ts || ts,
       });
       statusMessageTs = statusResult.ts;
+
+      // Track this message for cleanup
+      if (statusMessageTs) {
+        const messages = this.botMessages.get(sessionKey) || [];
+        messages.push(statusMessageTs);
+        this.botMessages.set(sessionKey, messages);
+      }
 
       // Add thinking reaction to original message (but don't spam if already set)
       await this.updateMessageReaction(sessionKey, '🤔');
@@ -292,23 +319,37 @@ export class SlackHandler {
             // For other tool use messages, format them immediately as new messages
             const toolContent = this.formatToolUse(message.message.content);
             if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
-              await say({
+              const result = await say({
                 text: toolContent,
                 thread_ts: thread_ts || ts,
               });
+
+              // Track this message for cleanup
+              if (result?.ts) {
+                const messages = this.botMessages.get(sessionKey) || [];
+                messages.push(result.ts);
+                this.botMessages.set(sessionKey, messages);
+              }
             }
           } else {
             // Handle regular text content
             const content = this.extractTextContent(message);
             if (content) {
               currentMessages.push(content);
-              
+
               // Send each new piece of content as a separate message
               const formatted = this.formatMessage(content, false);
-              await say({
+              const result = await say({
                 text: formatted,
                 thread_ts: thread_ts || ts,
               });
+
+              // Track this message for cleanup
+              if (result?.ts) {
+                const messages = this.botMessages.get(sessionKey) || [];
+                messages.push(result.ts);
+                this.botMessages.set(sessionKey, messages);
+              }
             }
           }
         } else if (message.type === 'result') {
@@ -323,10 +364,17 @@ export class SlackHandler {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
               const formatted = this.formatMessage(finalResult, true);
-              await say({
+              const result = await say({
                 text: formatted,
                 thread_ts: thread_ts || ts,
               });
+
+              // Track this message for cleanup
+              if (result?.ts) {
+                const messages = this.botMessages.get(sessionKey) || [];
+                messages.push(result.ts);
+                this.botMessages.set(sessionKey, messages);
+              }
             }
           }
         }
@@ -549,10 +597,17 @@ export class SlackHandler {
       // Send status change notification if there are meaningful changes
       const statusChange = this.todoManager.getStatusChange(oldTodos, newTodos);
       if (statusChange) {
-        await say({
+        const result = await say({
           text: `🔄 *Task Update:*\n${statusChange}`,
           thread_ts: threadTs,
         });
+
+        // Track this message for cleanup
+        if (result?.ts) {
+          const messages = this.botMessages.get(sessionKey) || [];
+          messages.push(result.ts);
+          this.botMessages.set(sessionKey, messages);
+        }
       }
 
       // Update reaction based on overall progress
@@ -561,20 +616,25 @@ export class SlackHandler {
   }
 
   private async createNewTodoMessage(
-    todoList: string, 
-    channel: string, 
-    threadTs: string, 
-    sessionKey: string, 
+    todoList: string,
+    channel: string,
+    threadTs: string,
+    sessionKey: string,
     say: any
   ): Promise<void> {
     const result = await say({
       text: todoList,
       thread_ts: threadTs,
     });
-    
+
     if (result?.ts) {
       this.todoMessages.set(sessionKey, result.ts);
       this.logger.debug('Created new todo message', { sessionKey, messageTs: result.ts });
+
+      // Track this message for cleanup
+      const messages = this.botMessages.get(sessionKey) || [];
+      messages.push(result.ts);
+      this.botMessages.set(sessionKey, messages);
     }
   }
 
