@@ -1190,12 +1190,46 @@ export class SlackHandler {
       return;
     }
 
+    // Get the session mapping to retrieve working directory
+    const sessionMapping = this.tmuxManager.getSessionByName(sessionName);
+    if (!sessionMapping) {
+      await say({
+        text: `❌ Failed to retrieve session information for \`${sessionName}\``,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Map this thread to the session
+    if (!this.tmuxManager.mapThreadToSession(channel, threadTs, sessionName)) {
+      await say({
+        text: `❌ Failed to map thread to session \`${sessionName}\``,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Set working directory for this thread
+    if (sessionMapping.workingDirectory) {
+      const isDM = channel.startsWith('D');
+      this.workingDirManager.setWorkingDirectory(
+        channel,
+        sessionMapping.workingDirectory,
+        threadTs,
+        isDM ? undefined : undefined
+      );
+      this.logger.info('Set working directory for connected thread', {
+        threadTs,
+        workingDirectory: sessionMapping.workingDirectory,
+      });
+    }
+
     await say({
-      text: formatSessionInfo(sessionName),
+      text: formatSessionInfo(sessionName) + `\n\n📁 *Working Directory:* \`${sessionMapping.workingDirectory || 'Not set'}\``,
       thread_ts: threadTs,
     });
 
-    this.logger.info('Connected to existing session', { sessionName, threadTs });
+    this.logger.info('Connected to existing session', { sessionName, threadTs, workingDirectory: sessionMapping.workingDirectory });
   }
 
   private formatAvailableSessions(): string {

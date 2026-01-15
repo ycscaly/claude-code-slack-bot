@@ -9,7 +9,7 @@ const logger = new Logger('TmuxManager');
 // Storage for session mappings
 const SESSION_STORAGE_FILE = path.join(os.tmpdir(), 'claude-slack-bot-sessions.json');
 
-interface SessionMapping {
+export interface SessionMapping {
   threadKey: string; // channel-threadTs
   sessionName: string;
   createdAt: number;
@@ -143,6 +143,39 @@ export class TmuxManager {
 
   connectToSession(sessionName: string): boolean {
     return this.sessionExists(sessionName);
+  }
+
+  // Get session mapping by session name
+  getSessionByName(sessionName: string): SessionMapping | null {
+    for (const mapping of this.sessions.values()) {
+      if (mapping.sessionName === sessionName) {
+        return mapping;
+      }
+    }
+    return null;
+  }
+
+  // Map a thread to an existing session
+  mapThreadToSession(channel: string, threadTs: string, sessionName: string): boolean {
+    const sessionMapping = this.getSessionByName(sessionName);
+    if (!sessionMapping) {
+      logger.warn('Cannot map thread to non-existent session', { sessionName });
+      return false;
+    }
+
+    const threadKey = this.getThreadKey(channel, threadTs);
+    const newMapping: SessionMapping = {
+      threadKey,
+      sessionName,
+      createdAt: Date.now(),
+      workingDirectory: sessionMapping.workingDirectory,
+    };
+
+    this.sessions.set(threadKey, newMapping);
+    this.saveSessions();
+
+    logger.info('Mapped thread to existing session', { threadKey, sessionName, workingDirectory: sessionMapping.workingDirectory });
+    return true;
   }
 
   // Execute command in tmux session
