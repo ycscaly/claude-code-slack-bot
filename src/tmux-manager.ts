@@ -157,24 +157,29 @@ export class TmuxManager {
 
   // Map a thread to an existing session
   mapThreadToSession(channel: string, threadTs: string, sessionName: string): boolean {
-    const sessionMapping = this.getSessionByName(sessionName);
-    if (!sessionMapping) {
+    // Check if the tmux session actually exists
+    if (!this.sessionExists(sessionName)) {
       logger.warn('Cannot map thread to non-existent session', { sessionName });
       return false;
     }
 
     const threadKey = this.getThreadKey(channel, threadTs);
+
+    // Try to get working directory from existing mapping, or query tmux directly
+    const existingMapping = this.getSessionByName(sessionName);
+    const workingDirectory = existingMapping?.workingDirectory || this.getWorkingDirectory(sessionName) || undefined;
+
     const newMapping: SessionMapping = {
       threadKey,
       sessionName,
       createdAt: Date.now(),
-      workingDirectory: sessionMapping.workingDirectory,
+      workingDirectory,
     };
 
     this.sessions.set(threadKey, newMapping);
     this.saveSessions();
 
-    logger.info('Mapped thread to existing session', { threadKey, sessionName, workingDirectory: sessionMapping.workingDirectory });
+    logger.info('Mapped thread to existing session', { threadKey, sessionName, workingDirectory });
     return true;
   }
 
