@@ -8,8 +8,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { WebClient } from '@slack/web-api';
 import { Logger } from './logger.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 const logger = new Logger('PermissionMCP');
+
+// IPC directory for permission approvals
+const IPC_DIR = path.join(os.tmpdir(), 'claude-slack-bot-permissions');
+
+// Ensure IPC directory exists
+if (!fs.existsSync(IPC_DIR)) {
+  fs.mkdirSync(IPC_DIR, { recursive: true });
+}
 
 interface PermissionRequest {
   tool_name: string;
@@ -25,13 +36,14 @@ interface PermissionResponse {
   message?: string;
 }
 
-class PermissionMCPServer {
+export class PermissionMCPServer {
   private server: Server;
   private slack: WebClient;
   private pendingApprovals = new Map<string, {
     resolve: (response: PermissionResponse) => void;
     reject: (error: Error) => void;
   }>();
+  private waitingSessions = new Set<string>(); // Track sessions waiting for approval
 
   constructor() {
     this.server = new Server(
@@ -90,7 +102,7 @@ class PermissionMCPServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name === "permission_prompt") {
-        return await this.handlePermissionPrompt(request.params.arguments as PermissionRequest);
+        return await this.handlePermissionPrompt(request.params.arguments as unknown as PermissionRequest);
       }
       throw new Error(`Unknown tool: ${request.params.name}`);
     });
@@ -98,14 +110,18 @@ class PermissionMCPServer {
 
   private async handlePermissionPrompt(params: PermissionRequest) {
     const { tool_name, input } = params;
-    
+
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
     const { channel, threadTs: thread_ts, user } = slackContext;
-    
+
     // Generate unique approval ID
     const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Mark this session as waiting for permission
+    const sessionKey = `${user}-${channel}-${thread_ts || 'direct'}`;
+    this.waitingSessions.add(sessionKey);
     
     // Create approval message with buttons
     const blocks = [
@@ -113,7 +129,7 @@ class PermissionMCPServer {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `🔐 *Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``
+          text: `🔐 *BLOCKED - Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``
         }
       },
       {
@@ -158,12 +174,15 @@ class PermissionMCPServer {
         channel: channel || user || 'general',
         thread_ts: thread_ts,
         blocks,
-        text: `Permission request for ${tool_name}` // Fallback text
+        text: `BLOCKED - Permission request for ${tool_name}` // Fallback text
       });
 
       // Wait for user response
       const response = await this.waitForApproval(approvalId);
-      
+
+      // Clear waiting state
+      this.waitingSessions.delete(sessionKey);
+
       // Update the message to show the result
       if (result.ts) {
         await this.slack.chat.update({
@@ -201,7 +220,10 @@ class PermissionMCPServer {
       };
     } catch (error) {
       logger.error('Error handling permission prompt:', error);
-      
+
+      // Clear waiting state on error
+      this.waitingSessions.delete(sessionKey);
+
       // Default to deny if there's an error
       const response: PermissionResponse = {
         behavior: 'deny',
@@ -220,20 +242,37 @@ class PermissionMCPServer {
   }
 
   private async waitForApproval(approvalId: string): Promise<PermissionResponse> {
+    // Write pending approval file so other processes know we're waiting
+    const pendingFile = path.join(IPC_DIR, `${approvalId}.pending`);
+    fs.writeFileSync(pendingFile, JSON.stringify({ approvalId, timestamp: Date.now() }));
+
+    // Poll for response file (no timeout - wait indefinitely)
     return new Promise((resolve, reject) => {
-      // Store the promise resolvers
-      this.pendingApprovals.set(approvalId, { resolve, reject });
-      
-      // Set timeout (5 minutes)
-      setTimeout(() => {
-        if (this.pendingApprovals.has(approvalId)) {
-          this.pendingApprovals.delete(approvalId);
-          resolve({
-            behavior: 'deny',
-            message: 'Permission request timed out'
-          });
+      const responseFile = path.join(IPC_DIR, `${approvalId}.response`);
+
+      const checkInterval = setInterval(() => {
+        try {
+          if (fs.existsSync(responseFile)) {
+            // Read and parse the response
+            const responseData = fs.readFileSync(responseFile, 'utf8');
+            const response: PermissionResponse = JSON.parse(responseData);
+
+            // Clean up files
+            clearInterval(checkInterval);
+            try {
+              fs.unlinkSync(responseFile);
+              fs.unlinkSync(pendingFile);
+            } catch (err) {
+              logger.warn('Failed to clean up IPC files', err);
+            }
+
+            logger.info('Received approval response via IPC', { approvalId, behavior: response.behavior });
+            resolve(response);
+          }
+        } catch (error) {
+          logger.error('Error checking for approval response', error);
         }
-      }, 5 * 60 * 1000);
+      }, 500); // Check every 500ms
     });
   }
 
@@ -250,6 +289,36 @@ class PermissionMCPServer {
     }
   }
 
+  // Check if a session is waiting for permission approval
+  public isWaitingForPermission(sessionKey: string): boolean {
+    return this.waitingSessions.has(sessionKey);
+  }
+
+  // Static method to write approval response via IPC (called from slack handler)
+  public static writeApprovalResponse(approvalId: string, approved: boolean, updatedInput?: any) {
+    const response: PermissionResponse = {
+      behavior: approved ? 'allow' : 'deny',
+      updatedInput: updatedInput || undefined,
+      message: approved ? 'Approved by user' : 'Denied by user'
+    };
+
+    const responseFile = path.join(IPC_DIR, `${approvalId}.response`);
+    fs.writeFileSync(responseFile, JSON.stringify(response));
+    logger.info('Wrote approval response via IPC', { approvalId, approved });
+  }
+
+  // Static method to check if there are pending approvals (for session tracking)
+  public static hasPendingApproval(sessionKey: string): boolean {
+    try {
+      const files = fs.readdirSync(IPC_DIR);
+      // Check if there are any .pending files for this session
+      // We can't directly match session key to approval ID, so we check if any pending files exist
+      return files.some(f => f.endsWith('.pending'));
+    } catch {
+      return false;
+    }
+  }
+
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -261,7 +330,7 @@ class PermissionMCPServer {
 export const permissionServer = new PermissionMCPServer();
 
 // Run if this file is executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (require.main === module) {
   permissionServer.run().catch((error) => {
     logger.error('Permission MCP server error:', error);
     process.exit(1);

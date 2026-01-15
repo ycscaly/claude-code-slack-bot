@@ -6,7 +6,7 @@ import { WorkingDirectoryManager } from './working-directory-manager';
 import { FileHandler, ProcessedFile } from './file-handler';
 import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
-import { permissionServer } from './permission-mcp-server';
+import { PermissionMCPServer } from './permission-mcp-server';
 import { config } from './config';
 
 interface MessageEvent {
@@ -79,7 +79,7 @@ export class SlackHandler {
     });
 
     // Check if this is a working directory command (only if there's text)
-    const setDirPath = text ? this.workingDirManager.parseSetCommand(text) : null;
+    const setDirPath = text ? this.workingDirManager.parseSetCommand(text.trim()) : null;
     if (setDirPath) {
       const isDM = channel.startsWith('D');
       const result = this.workingDirManager.setWorkingDirectory(
@@ -188,14 +188,24 @@ export class SlackHandler {
     }
 
     const sessionKey = this.claudeHandler.getSessionKey(user, channel, thread_ts || ts);
-    
+
     // Store the original message info for status reactions
     const originalMessageTs = thread_ts || ts;
     this.originalMessages.set(sessionKey, { channel, ts: originalMessageTs });
-    
-    // Cancel any existing request for this conversation
+
+    // Cancel any existing request for this conversation UNLESS it's waiting for permission
     const existingController = this.activeControllers.get(sessionKey);
     if (existingController) {
+      // Check if there are pending approval requests via IPC
+      if (PermissionMCPServer.hasPendingApproval(sessionKey)) {
+        this.logger.info('Session is waiting for permission approval, not aborting', { sessionKey });
+        await say({
+          text: '⚠️ A previous request is waiting for your permission approval. Please approve or deny it before sending new messages.',
+          thread_ts: thread_ts || ts,
+        });
+        return;
+      }
+
       this.logger.debug('Cancelling existing request for session', { sessionKey });
       existingController.abort();
     }
@@ -754,9 +764,10 @@ export class SlackHandler {
       await ack();
       const approvalId = (body as any).actions[0].value;
       this.logger.info('Tool approval granted', { approvalId });
-      
-      permissionServer.resolveApproval(approvalId, true);
-      
+
+      // Write approval response via IPC so the MCP server process can read it
+      PermissionMCPServer.writeApprovalResponse(approvalId, true);
+
       await respond({
         response_type: 'ephemeral',
         text: '✅ Tool execution approved'
@@ -768,9 +779,10 @@ export class SlackHandler {
       await ack();
       const approvalId = (body as any).actions[0].value;
       this.logger.info('Tool approval denied', { approvalId });
-      
-      permissionServer.resolveApproval(approvalId, false);
-      
+
+      // Write denial response via IPC so the MCP server process can read it
+      PermissionMCPServer.writeApprovalResponse(approvalId, false);
+
       await respond({
         response_type: 'ephemeral',
         text: '❌ Tool execution denied'
