@@ -129,7 +129,7 @@ export class PermissionMCPServer {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `🔐 *BLOCKED - Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``
+          text: `🔐 *BLOCKED - Permission Request*\n\nClaude wants to use the tool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`\n${JSON.stringify(input, null, 2)}\n\`\`\``
         }
       },
       {
@@ -193,7 +193,7 @@ export class PermissionMCPServer {
               type: "section",
               text: {
                 type: "mrkdwn",
-                text: `🔐 *Permission Request* - ${response.behavior === 'allow' ? '✅ Approved' : '❌ Denied'}\n\nTool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``
+                text: `🔐 *Permission Request* - ${response.behavior === 'allow' ? '✅ Approved' : '❌ Denied'}\n\nTool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`\n${JSON.stringify(input, null, 2)}\n\`\`\``
               }
             },
             {
