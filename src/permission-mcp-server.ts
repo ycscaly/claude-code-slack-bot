@@ -183,31 +183,17 @@ export class PermissionMCPServer {
       // Clear waiting state
       this.waitingSessions.delete(sessionKey);
 
-      // Update the message to show the result
+      // Delete the permission request message after approval/denial
       if (result.ts) {
-        await this.slack.chat.update({
-          channel: result.channel!,
-          ts: result.ts,
-          blocks: [
-            {
-              type: "section",
-              text: {
-                type: "mrkdwn",
-                text: `🔐 *Permission Request* - ${response.behavior === 'allow' ? '✅ Approved' : '❌ Denied'}\n\nTool: \`${tool_name}\`\n\n*Tool Parameters:*\n\`\`\`\n${JSON.stringify(input, null, 2)}\n\`\`\``
-              }
-            },
-            {
-              type: "context",
-              elements: [
-                {
-                  type: "mrkdwn",
-                  text: `${response.behavior === 'allow' ? 'Approved' : 'Denied'} by user | Tool: ${tool_name}`
-                }
-              ]
-            }
-          ],
-          text: `Permission ${response.behavior === 'allow' ? 'approved' : 'denied'} for ${tool_name}`
-        });
+        try {
+          await this.slack.chat.delete({
+            channel: result.channel!,
+            ts: result.ts,
+          });
+          logger.info('Deleted permission request message', { approvalId, behavior: response.behavior });
+        } catch (error) {
+          logger.warn('Failed to delete permission request message', error);
+        }
       }
 
       return {
