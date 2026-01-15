@@ -426,7 +426,7 @@ export class SlackHandler {
         await this.app.client.chat.update({
           channel,
           ts: statusMessageTs,
-          text: '✅ *Task completed*',
+          text: 'COMPLETED ✅ *Task completed*',
         });
       }
 
@@ -1061,7 +1061,7 @@ export class SlackHandler {
         await this.app.client.chat.update({
           channel,
           ts: statusMessageTs,
-          text: '✅ *Task completed*',
+          text: 'COMPLETED ✅ *Task completed*',
         });
       }
 
