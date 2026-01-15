@@ -200,4 +200,16 @@ export class TmuxManager {
       return '';
     }
   }
+
+  // Get current working directory from tmux session
+  getWorkingDirectory(sessionName: string): string | null {
+    try {
+      const cwd = execSync(`tmux display-message -t "${sessionName}" -p "#{pane_current_path}"`).toString().trim();
+      logger.debug('Got working directory from tmux session', { sessionName, cwd });
+      return cwd;
+    } catch (error) {
+      logger.error('Failed to get working directory from tmux session', { sessionName, error });
+      return null;
+    }
+  }
 }

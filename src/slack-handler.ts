@@ -1190,11 +1190,11 @@ export class SlackHandler {
       return;
     }
 
-    // Get the session mapping to retrieve working directory
-    const sessionMapping = this.tmuxManager.getSessionByName(sessionName);
-    if (!sessionMapping) {
+    // Get working directory directly from the tmux session
+    const workingDirectory = this.tmuxManager.getWorkingDirectory(sessionName);
+    if (!workingDirectory) {
       await say({
-        text: `❌ Failed to retrieve session information for \`${sessionName}\``,
+        text: `❌ Failed to get working directory from session \`${sessionName}\``,
         thread_ts: threadTs,
       });
       return;
@@ -1210,26 +1210,33 @@ export class SlackHandler {
     }
 
     // Set working directory for this thread
-    if (sessionMapping.workingDirectory) {
-      const isDM = channel.startsWith('D');
-      this.workingDirManager.setWorkingDirectory(
-        channel,
-        sessionMapping.workingDirectory,
-        threadTs,
-        isDM ? undefined : undefined
-      );
-      this.logger.info('Set working directory for connected thread', {
-        threadTs,
-        workingDirectory: sessionMapping.workingDirectory,
+    const isDM = channel.startsWith('D');
+    const result = this.workingDirManager.setWorkingDirectory(
+      channel,
+      workingDirectory,
+      threadTs,
+      isDM ? undefined : undefined
+    );
+
+    if (!result.success) {
+      await say({
+        text: `❌ Failed to set working directory: ${result.error}`,
+        thread_ts: threadTs,
       });
+      return;
     }
 
+    this.logger.info('Set working directory for connected thread', {
+      threadTs,
+      workingDirectory: result.resolvedPath,
+    });
+
     await say({
-      text: formatSessionInfo(sessionName) + `\n\n📁 *Working Directory:* \`${sessionMapping.workingDirectory || 'Not set'}\``,
+      text: formatSessionInfo(sessionName) + `\n\n📁 *Working Directory:* \`${result.resolvedPath}\``,
       thread_ts: threadTs,
     });
 
-    this.logger.info('Connected to existing session', { sessionName, threadTs, workingDirectory: sessionMapping.workingDirectory });
+    this.logger.info('Connected to existing session', { sessionName, threadTs, workingDirectory: result.resolvedPath });
   }
 
   private formatAvailableSessions(): string {
