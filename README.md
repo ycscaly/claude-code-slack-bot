@@ -10,12 +10,18 @@ A Slack bot that integrates with Claude Code SDK to provide AI-powered coding as
 - 📝 Markdown formatting - code blocks and formatting are preserved
 - 🔧 Session management - maintains conversation context across messages
 - ⚡ Real-time updates - messages update as Claude thinks
+- 🎯 **Persistent tmux sessions** - each thread gets its own session
+- 📬 **Message queuing** - queue messages while Claude works
+- 🔀 **Parallel task execution** - run multiple tasks across different threads
+- 🛑 **Interrupt support** - stop and redirect Claude with emoji commands
+- ✅ **Clean thread management** - close sessions and optionally delete threads
 
 ## Prerequisites
 
 - Node.js 18+ installed
 - A Slack workspace where you can install apps
 - Claude Code
+- **tmux** installed (for session management)
 
 ## Setup
 
@@ -91,6 +97,97 @@ npm run prod
 ```
 
 ## Usage
+
+### Session Management & Threading
+
+The bot uses a sophisticated session management system where **each thread gets its own persistent tmux session**. This allows you to:
+- Run multiple tasks in parallel across different threads
+- Queue messages without interrupting current work
+- Maintain persistent sessions that survive bot restarts
+- Interrupt and redirect Claude when needed
+
+#### Starting a New Session
+
+Simply send a message in a channel or start a thread. The bot will create a new tmux session and display:
+
+```
+📦 Session: claude_slack_001
+
+This thread is now connected to tmux session claude_slack_001.
+
+Commands:
+• 🛑 - Interrupt current execution
+• 🗑️ - Complete & delete thread
+• ✅ - Complete & keep thread
+• 🔌 session_name - Connect to existing session
+```
+
+#### Message Queuing
+
+While Claude is working on a task, you can send additional messages - they'll be queued automatically:
+
+```
+You: Implement the authentication system
+Bot: 🤔 Thinking...
+
+You: Also add tests when you're done
+Bot: 📬 Message queued (1 messages in queue)
+
+You: And update the README
+Bot: 📬 Message queued (2 messages in queue)
+```
+
+Messages process **sequentially** in the order received. No more "aborted by user" errors!
+
+#### Emoji Commands
+
+**🛑 Interrupt** - Stop current execution and process this message immediately
+```
+You: 🛑 Stop! Do the database migration first
+Bot: 🛑 Interrupted
+     Processing new message: Stop! Do the database migration first
+```
+This clears the queue and aborts current work.
+
+**🗑️ Complete & Delete** - Close the session and delete the entire thread
+```
+You: 🗑️
+Bot: 🗑️ Session claude_slack_001 closed. Deleting thread...
+```
+All messages in the thread are deleted. Use this for a clean slate.
+
+**✅ Complete & Keep** - Close the session but preserve the thread
+```
+You: ✅
+Bot: ✅ Session claude_slack_001 closed. Thread preserved.
+```
+Session is closed but conversation history remains.
+
+**🔌 Connect** - Connect to an existing tmux session
+```
+You: 🔌 claude_slack_001
+Bot: 📦 Session: claude_slack_001
+     [Connection confirmed]
+```
+
+#### Running Parallel Tasks
+
+Start a new thread for each task - they all run independently:
+
+```
+Thread 1: Building frontend components
+Thread 2: Writing API endpoints
+Thread 3: Creating database migrations
+```
+
+Each thread has its own:
+- Tmux session
+- Message queue
+- Independent execution
+
+#### Session Persistence
+
+Sessions are stored in `/tmp/claude-slack-bot-sessions.json` and survive bot restarts. Your work continues where you left off!
 
 ### Setting Working Directory
 
@@ -257,12 +354,19 @@ This will show detailed logs including:
 ### Project Structure
 ```
 src/
-├── index.ts          # Application entry point
-├── config.ts         # Configuration management
+├── index.ts                      # Application entry point
+├── config.ts                     # Configuration management
 ├── types.ts                      # TypeScript type definitions
 ├── claude-handler.ts             # Claude Code SDK integration
-├── slack-handler.ts              # Slack event handling
+├── slack-handler.ts              # Slack event handling & session orchestration
 ├── working-directory-manager.ts  # Working directory management
+├── tmux-manager.ts               # Tmux session management
+├── message-queue.ts              # Per-thread message queuing
+├── session-commands.ts           # Emoji command parsing
+├── permission-mcp-server.ts      # Permission approval via IPC
+├── file-handler.ts               # File upload processing
+├── todo-manager.ts               # Task list tracking
+├── mcp-manager.ts                # MCP server configuration
 └── logger.ts                     # Logging utility
 ```
 
