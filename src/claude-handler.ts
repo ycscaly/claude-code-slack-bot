@@ -105,6 +105,15 @@ export class ClaudeHandler {
       this.logger.debug('Starting new Claude conversation');
     }
 
+    // Add permanently allowed prompts for common development tools
+    options.allowedPrompts = [
+      { tool: 'Bash', prompt: 'run git commands' },
+      { tool: 'Bash', prompt: 'run GitHub CLI commands' },
+      { tool: 'Bash', prompt: 'run cargo commands' },
+      { tool: 'Bash', prompt: 'build and test with cargo' },
+      { tool: 'Bash', prompt: 'commit and push changes' },
+    ];
+
     // Add abort controller to options
     options.abortController = abortController || new AbortController();
 
