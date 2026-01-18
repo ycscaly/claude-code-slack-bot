@@ -183,33 +183,8 @@ export class SlackHandler {
 
     // Working directory is always required
     if (!workingDirectory) {
-      let errorMessage = `⚠️ No working directory set. `;
-      
-      if (!isDM && !this.workingDirManager.hasChannelWorkingDirectory(channel)) {
-        // No channel default set
-        errorMessage += `Please set a default working directory for this channel first using:\n`;
-        if (config.baseDirectory) {
-          errorMessage += `\`cwd project-name\` or \`cwd /absolute/path\`\n\n`;
-          errorMessage += `Base directory: \`${config.baseDirectory}\``;
-        } else {
-          errorMessage += `\`cwd /path/to/directory\``;
-        }
-      } else if (thread_ts) {
-        // In thread but no thread-specific directory
-        errorMessage += `You can set a thread-specific working directory using:\n`;
-        if (config.baseDirectory) {
-          errorMessage += `\`@claudebot cwd project-name\` or \`@claudebot cwd /absolute/path\``;
-        } else {
-          errorMessage += `\`@claudebot cwd /path/to/directory\``;
-        }
-      } else {
-        errorMessage += `Please set one first using:\n\`cwd /path/to/directory\``;
-      }
-      
-      await say({
-        text: errorMessage,
-        thread_ts: actualThreadTs,
-      });
+      // Ask user to select a project
+      await this.askForProjectSelection(channel, actualThreadTs, say, isDM ? user : undefined);
       return;
     }
 
@@ -823,6 +798,79 @@ export class SlackHandler {
     return formatted;
   }
 
+  private async askForProjectSelection(
+    channel: string,
+    threadTs: string,
+    say: any,
+    userId?: string
+  ): Promise<void> {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+
+      // List directories in projects directory
+      const projectsDir = config.projectsDirectory;
+      const entries = fs.readdirSync(projectsDir, { withFileTypes: true });
+      const projects = entries
+        .filter((entry: any) => entry.isDirectory())
+        .map((entry: any) => entry.name)
+        .sort();
+
+      if (projects.length === 0) {
+        await say({
+          text: `⚠️ No projects found in ${projectsDir}`,
+          thread_ts: threadTs,
+        });
+        return;
+      }
+
+      // Create blocks with buttons (max 5 per action block)
+      const blocks: any[] = [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `📂 *Select a project to work on:*\n_Projects directory: \`${projectsDir}\`_`
+          }
+        }
+      ];
+
+      // Add buttons in groups of 5
+      for (let i = 0; i < projects.length; i += 5) {
+        const chunk = projects.slice(i, i + 5);
+        blocks.push({
+          type: 'actions',
+          elements: chunk.map((project: string) => ({
+            type: 'button',
+            text: {
+              type: 'plain_text',
+              text: project.length > 75 ? project.substring(0, 72) + '...' : project,
+            },
+            value: JSON.stringify({
+              project,
+              channel,
+              threadTs,
+              userId,
+            }),
+            action_id: `select_project_${project}`,
+          }))
+        });
+      }
+
+      await say({
+        blocks,
+        text: `Select a project to work on`,
+        thread_ts: threadTs,
+      });
+    } catch (error) {
+      this.logger.error('Failed to list projects', error);
+      await say({
+        text: `❌ Failed to list projects: ${(error as Error).message}`,
+        thread_ts: threadTs,
+      });
+    }
+  }
+
   private async enqueueAndProcessMessage(
     user: string,
     channel: string,
@@ -1313,6 +1361,45 @@ export class SlackHandler {
         response_type: 'ephemeral',
         text: '❌ Tool execution denied'
       });
+    });
+
+    // Handle project selection button clicks
+    this.app.action(/^select_project_/, async ({ ack, body, respond }) => {
+      await ack();
+
+      try {
+        const action = (body as any).actions[0];
+        const data = JSON.parse(action.value);
+        const { project, channel, threadTs, userId } = data;
+
+        const path = require('path');
+        const projectPath = path.join(config.projectsDirectory, project);
+
+        this.logger.info('Project selected', { project, projectPath, channel, threadTs, userId });
+
+        // Set the working directory
+        this.workingDirManager.setWorkingDirectory(channel, projectPath, undefined, userId);
+
+        // Delete the project selection message
+        await this.app.client.chat.delete({
+          token: config.slack.botToken,
+          channel: channel,
+          ts: (body as any).message.ts,
+        });
+
+        // Send confirmation
+        await respond({
+          response_type: 'in_channel',
+          text: `✅ Working directory set to: \`${projectPath}\`\n\nYou can now send your message to start working on this project.`,
+          thread_ts: threadTs,
+        });
+      } catch (error) {
+        this.logger.error('Failed to handle project selection', error);
+        await respond({
+          response_type: 'ephemeral',
+          text: `❌ Failed to set working directory: ${(error as Error).message}`
+        });
+      }
     });
 
     // Cleanup inactive sessions periodically

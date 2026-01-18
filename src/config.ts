@@ -16,6 +16,7 @@ export const config = {
     useVertex: process.env.CLAUDE_CODE_USE_VERTEX === '1',
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
+  projectsDirectory: process.env.PROJECTS_DIRECTORY || '/mnt/nvme0n1p1/',
   debug: process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development',
 };
 

@@ -42,14 +42,8 @@ export class ClaudeHandler {
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const options: any = {
       outputFormat: 'stream-json',
-      permissionMode: slackContext ? 'default' : 'bypassPermissions',
+      dangerouslySkipPermissions: true,
     };
-
-    // Add permission prompt tool if we have Slack context
-    if (slackContext) {
-      options.permissionPromptToolName = 'mcp__permission-prompt__permission_prompt';
-      this.logger.debug('Added permission prompt tool for Slack integration', slackContext);
-    }
 
     if (workingDirectory) {
       options.cwd = workingDirectory;
@@ -57,44 +51,20 @@ export class ClaudeHandler {
 
     // Add MCP server configuration if available
     const mcpServers = this.mcpManager.getServerConfiguration();
-    
-    // Add permission prompt server if we have Slack context
-    if (slackContext) {
-      const permissionServer = {
-        'permission-prompt': {
-          command: 'npx',
-          args: ['tsx', path.join(__dirname, 'permission-mcp-server.ts')],
-          env: {
-            SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
-            SLACK_CONTEXT: JSON.stringify(slackContext)
-          }
-        }
-      };
-      
-      if (mcpServers) {
-        options.mcpServers = { ...mcpServers, ...permissionServer };
-      } else {
-        options.mcpServers = permissionServer;
-      }
-    } else if (mcpServers && Object.keys(mcpServers).length > 0) {
+
+    if (mcpServers && Object.keys(mcpServers).length > 0) {
       options.mcpServers = mcpServers;
-    }
-    
-    if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
-      // Allow all MCP tools by default, plus permission prompt tool
+
+      // Allow all MCP tools by default
       const defaultMcpTools = this.mcpManager.getDefaultAllowedTools();
-      if (slackContext) {
-        defaultMcpTools.push('mcp__permission-prompt');
-      }
       if (defaultMcpTools.length > 0) {
         options.allowedTools = defaultMcpTools;
       }
-      
+
       this.logger.debug('Added MCP configuration to options', {
         serverCount: Object.keys(options.mcpServers).length,
         servers: Object.keys(options.mcpServers),
         allowedTools: defaultMcpTools,
-        hasSlackContext: !!slackContext,
       });
     }
 
@@ -104,15 +74,6 @@ export class ClaudeHandler {
     } else {
       this.logger.debug('Starting new Claude conversation');
     }
-
-    // Add permanently allowed prompts for common development tools
-    options.allowedPrompts = [
-      { tool: 'Bash', prompt: 'run git commands' },
-      { tool: 'Bash', prompt: 'run GitHub CLI commands' },
-      { tool: 'Bash', prompt: 'run cargo commands' },
-      { tool: 'Bash', prompt: 'build and test with cargo' },
-      { tool: 'Bash', prompt: 'commit and push changes' },
-    ];
 
     // Add abort controller to options
     options.abortController = abortController || new AbortController();
