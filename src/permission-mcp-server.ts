@@ -7,12 +7,23 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { WebClient } from '@slack/web-api';
-import { Logger } from './logger.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-const logger = new Logger('PermissionMCP');
+// MCP servers use STDIO for JSON-RPC communication, so we cannot log to stdout/stderr
+// Instead, log to a file
+const LOG_FILE = path.join(os.tmpdir(), 'claude-slack-bot-permission-mcp.log');
+
+function log(level: string, message: string, data?: any) {
+  const timestamp = new Date().toISOString();
+  const logLine = `[${timestamp}] [${level}] ${message} ${data ? JSON.stringify(data) : ''}\n`;
+  try {
+    fs.appendFileSync(LOG_FILE, logLine);
+  } catch (error) {
+    // Silently fail if we can't log
+  }
+}
 
 // IPC directory for permission approvals
 const IPC_DIR = path.join(os.tmpdir(), 'claude-slack-bot-permissions');
@@ -111,25 +122,25 @@ export class PermissionMCPServer {
   private async handlePermissionPrompt(params: PermissionRequest) {
     const { tool_name, input } = params;
 
-    logger.info('Permission prompt requested', { tool_name, inputKeys: Object.keys(input || {}) });
+    log("INFO", 'Permission prompt requested', { tool_name, inputKeys: Object.keys(input || {}) });
 
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
     const { channel, threadTs: thread_ts, user } = slackContext;
 
-    logger.info('Slack context', { channel, thread_ts, user });
+    log("INFO", 'Slack context', { channel, thread_ts, user });
 
     // Generate unique approval ID
     const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    logger.info('Generated approval ID', { approvalId });
+    log("INFO", 'Generated approval ID', { approvalId });
 
     // Mark this session as waiting for permission
     const sessionKey = `${user}-${channel}-${thread_ts || 'direct'}`;
     this.waitingSessions.add(sessionKey);
 
-    logger.info('Session marked as waiting for permission', { sessionKey });
+    log("INFO", 'Session marked as waiting for permission', { sessionKey });
     
     // Create approval message with buttons
     const blocks = [
@@ -185,12 +196,12 @@ export class PermissionMCPServer {
         text: `BLOCKED - Permission request for ${tool_name}` // Fallback text
       });
 
-      logger.info('Waiting for user approval', { approvalId });
+      log("INFO", 'Waiting for user approval', { approvalId });
 
       // Wait for user response
       const response = await this.waitForApproval(approvalId);
 
-      logger.info('Received approval response', { approvalId, behavior: response.behavior });
+      log("INFO", 'Received approval response', { approvalId, behavior: response.behavior });
 
       // Clear waiting state
       this.waitingSessions.delete(sessionKey);
@@ -202,16 +213,16 @@ export class PermissionMCPServer {
             channel: result.channel!,
             ts: result.ts,
           });
-          logger.info('Deleted permission request message', { approvalId, behavior: response.behavior });
+          log("INFO", 'Deleted permission request message', { approvalId, behavior: response.behavior });
         } catch (error) {
-          logger.warn('Failed to delete permission request message', error);
+          log("WARN", 'Failed to delete permission request message', error);
         }
       }
 
       // Return the response in a format Claude Code SDK can understand
       const responseText = response.behavior === 'allow' ? 'APPROVED' : 'DENIED';
 
-      logger.info('Returning permission response to Claude Code SDK', {
+      log("INFO", 'Returning permission response to Claude Code SDK', {
         approvalId,
         behavior: response.behavior,
         responseText,
@@ -228,7 +239,7 @@ export class PermissionMCPServer {
         isError: response.behavior === 'deny'
       };
     } catch (error) {
-      logger.error('Error handling permission prompt:', error);
+      log("ERROR", 'Error handling permission prompt:', error);
 
       // Clear waiting state on error
       this.waitingSessions.delete(sessionKey);
@@ -272,14 +283,14 @@ export class PermissionMCPServer {
               fs.unlinkSync(responseFile);
               fs.unlinkSync(pendingFile);
             } catch (err) {
-              logger.warn('Failed to clean up IPC files', err);
+              log("WARN", 'Failed to clean up IPC files', err);
             }
 
-            logger.info('Received approval response via IPC', { approvalId, behavior: response.behavior });
+            log("INFO", 'Received approval response via IPC', { approvalId, behavior: response.behavior });
             resolve(response);
           }
         } catch (error) {
-          logger.error('Error checking for approval response', error);
+          log("ERROR", 'Error checking for approval response', error);
         }
       }, 500); // Check every 500ms
     });
@@ -313,7 +324,7 @@ export class PermissionMCPServer {
 
     const responseFile = path.join(IPC_DIR, `${approvalId}.response`);
     fs.writeFileSync(responseFile, JSON.stringify(response));
-    logger.info('Wrote approval response via IPC', { approvalId, approved });
+    log("INFO", 'Wrote approval response via IPC', { approvalId, approved });
   }
 
   // Static method to check if there are pending approvals (for session tracking)
@@ -331,7 +342,7 @@ export class PermissionMCPServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    logger.info('Permission MCP server started');
+    log("INFO", 'Permission MCP server started');
   }
 }
 
@@ -341,7 +352,7 @@ export const permissionServer = new PermissionMCPServer();
 // Run if this file is executed directly
 if (require.main === module) {
   permissionServer.run().catch((error) => {
-    logger.error('Permission MCP server error:', error);
+    log("ERROR", 'Permission MCP server error:', error);
     process.exit(1);
   });
 }
