@@ -173,24 +173,35 @@ export class SlackHandler {
       return;
     }
 
-    // Check if we have a working directory set
-    const isDM = channel.startsWith('D');
-    const workingDirectory = this.workingDirManager.getWorkingDirectory(
-      channel,
-      thread_ts,
-      isDM ? user : undefined
-    );
-
-    // Working directory is always required
-    if (!workingDirectory) {
-      // Ask user to select a project
-      await this.askForProjectSelection(channel, actualThreadTs, say, isDM ? user : undefined);
-      return;
-    }
-
     // NEW SESSION-BASED QUEUING SYSTEM
     // If this is a threaded message (or becomes a thread), handle via queue
     if (actualThreadTs) {
+      // Check if this is a new thread (no tmux session exists yet)
+      const existingSession = this.tmuxManager.getSession(channel, actualThreadTs);
+
+      if (!existingSession) {
+        // New thread - ask for project selection
+        const isDM = channel.startsWith('D');
+        await this.askForProjectSelection(channel, actualThreadTs, say, isDM ? user : undefined, text || '');
+        return;
+      }
+
+      // Existing thread - get working directory and process message
+      const isDM = channel.startsWith('D');
+      const workingDirectory = this.workingDirManager.getWorkingDirectory(
+        channel,
+        actualThreadTs,
+        isDM ? user : undefined
+      );
+
+      if (!workingDirectory) {
+        await say({
+          text: '⚠️ No working directory set for this thread.',
+          thread_ts: actualThreadTs,
+        });
+        return;
+      }
+
       await this.enqueueAndProcessMessage(
         user,
         channel,
@@ -200,6 +211,19 @@ export class SlackHandler {
         workingDirectory,
         say
       );
+      return;
+    }
+
+    // For non-threaded messages, still check working directory
+    const isDM = channel.startsWith('D');
+    const workingDirectory = this.workingDirManager.getWorkingDirectory(
+      channel,
+      thread_ts,
+      isDM ? user : undefined
+    );
+
+    if (!workingDirectory) {
+      await this.askForProjectSelection(channel, actualThreadTs, say, isDM ? user : undefined, text || '');
       return;
     }
 
@@ -798,15 +822,24 @@ export class SlackHandler {
     return formatted;
   }
 
+  private pendingThreadMessages: Map<string, string> = new Map(); // threadKey -> initial message
+
   private async askForProjectSelection(
     channel: string,
     threadTs: string,
     say: any,
-    userId?: string
+    userId?: string,
+    initialMessage?: string
   ): Promise<void> {
     try {
       const fs = require('fs');
       const path = require('path');
+
+      // Store the initial message to process after project selection
+      if (initialMessage) {
+        const threadKey = `${channel}-${threadTs}`;
+        this.pendingThreadMessages.set(threadKey, initialMessage);
+      }
 
       // List directories in projects directory
       const projectsDir = config.projectsDirectory;
@@ -1371,14 +1404,30 @@ export class SlackHandler {
         const action = (body as any).actions[0];
         const data = JSON.parse(action.value);
         const { project, channel, threadTs, userId } = data;
+        const user = (body as any).user.id;
 
         const path = require('path');
+        const { execSync } = require('child_process');
         const projectPath = path.join(config.projectsDirectory, project);
 
         this.logger.info('Project selected', { project, projectPath, channel, threadTs, userId });
 
-        // Set the working directory
-        this.workingDirManager.setWorkingDirectory(channel, projectPath, undefined, userId);
+        // Set the working directory for this thread
+        this.workingDirManager.setWorkingDirectory(channel, projectPath, threadTs, userId);
+
+        // Create tmux session for this thread
+        const sessionName = this.tmuxManager.createSession(channel, threadTs, projectPath);
+
+        // Get git branch
+        let gitBranch = 'unknown';
+        try {
+          gitBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+            cwd: projectPath,
+            encoding: 'utf8'
+          }).trim();
+        } catch (error) {
+          this.logger.warn('Failed to get git branch', { projectPath, error });
+        }
 
         // Delete the project selection message
         await this.app.client.chat.delete({
@@ -1387,12 +1436,47 @@ export class SlackHandler {
           ts: (body as any).message.ts,
         });
 
-        // Send confirmation
-        await respond({
-          response_type: 'in_channel',
-          text: `✅ Working directory set to: \`${projectPath}\`\n\nYou can now send your message to start working on this project.`,
+        // Send welcome message with session info
+        const welcomeText = formatSessionInfo(sessionName) +
+          `\n\n📁 *Project:* \`${project}\`` +
+          `\n🌿 *Branch:* \`${gitBranch}\`` +
+          `\n\n💬 What would you like me to help you with?`;
+
+        await this.app.client.chat.postMessage({
+          token: config.slack.botToken,
+          channel: channel,
           thread_ts: threadTs,
+          text: welcomeText,
         });
+
+        // Check if there's a pending message to process
+        const threadKey = `${channel}-${threadTs}`;
+        const pendingMessage = this.pendingThreadMessages.get(threadKey);
+        if (pendingMessage) {
+          this.pendingThreadMessages.delete(threadKey);
+
+          // Process the pending message
+          const command = parseSessionCommand(pendingMessage);
+          this.messageQueue.enqueue(channel, threadTs, {
+            text: command.messageText || pendingMessage,
+            files: [],
+            timestamp: Date.now(),
+            isInterrupt: false,
+          });
+
+          // Create a say function for this thread
+          const say = async (message: any) => {
+            await this.app.client.chat.postMessage({
+              token: config.slack.botToken,
+              channel: channel,
+              thread_ts: threadTs,
+              ...message,
+            });
+          };
+
+          // Start processing the queue
+          this.processMessageQueue(user, channel, threadTs, projectPath, say);
+        }
       } catch (error) {
         this.logger.error('Failed to handle project selection', error);
         await respond({
