@@ -111,17 +111,25 @@ export class PermissionMCPServer {
   private async handlePermissionPrompt(params: PermissionRequest) {
     const { tool_name, input } = params;
 
+    logger.info('Permission prompt requested', { tool_name, inputKeys: Object.keys(input || {}) });
+
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
     const { channel, threadTs: thread_ts, user } = slackContext;
 
+    logger.info('Slack context', { channel, thread_ts, user });
+
     // Generate unique approval ID
     const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    logger.info('Generated approval ID', { approvalId });
 
     // Mark this session as waiting for permission
     const sessionKey = `${user}-${channel}-${thread_ts || 'direct'}`;
     this.waitingSessions.add(sessionKey);
+
+    logger.info('Session marked as waiting for permission', { sessionKey });
     
     // Create approval message with buttons
     const blocks = [
@@ -177,8 +185,12 @@ export class PermissionMCPServer {
         text: `BLOCKED - Permission request for ${tool_name}` // Fallback text
       });
 
+      logger.info('Waiting for user approval', { approvalId });
+
       // Wait for user response
       const response = await this.waitForApproval(approvalId);
+
+      logger.info('Received approval response', { approvalId, behavior: response.behavior });
 
       // Clear waiting state
       this.waitingSessions.delete(sessionKey);
@@ -196,13 +208,24 @@ export class PermissionMCPServer {
         }
       }
 
+      // Return the response in a format Claude Code SDK can understand
+      const responseText = response.behavior === 'allow' ? 'APPROVED' : 'DENIED';
+
+      logger.info('Returning permission response to Claude Code SDK', {
+        approvalId,
+        behavior: response.behavior,
+        responseText,
+        fullResponse: response
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(response)
+            text: responseText
           }
-        ]
+        ],
+        isError: response.behavior === 'deny'
       };
     } catch (error) {
       logger.error('Error handling permission prompt:', error);

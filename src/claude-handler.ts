@@ -45,13 +45,18 @@ export class ClaudeHandler {
 
     const options: any = {
       outputFormat: 'stream-json',
-      permissionMode: shouldSkipPermissions ? 'bypassPermissions' : 'default',
     };
 
-    this.logger.debug('Permission mode', {
+    // Only set permissionMode when bypassing - otherwise let permissionPromptToolName handle it
+    if (shouldSkipPermissions) {
+      options.permissionMode = 'bypassPermissions';
+    }
+
+    this.logger.debug('Permission configuration', {
       skipPermissions: session?.skipPermissions,
       shouldSkipPermissions,
-      permissionMode: options.permissionMode,
+      permissionMode: options.permissionMode || 'custom',
+      willUseCustomPrompt: !shouldSkipPermissions && !!slackContext,
     });
 
     if (workingDirectory) {

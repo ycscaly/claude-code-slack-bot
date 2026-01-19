@@ -1598,17 +1598,60 @@ export class SlackHandler {
           ts: (body as any).message.ts,
         });
 
-        // Send welcome message with session info
+        // Send welcome message with session info and permission selection
         const welcomeText = formatSessionInfo(sessionName) +
           `\n\n📁 *Project:* \`${project}\`` +
           `\n🌿 *Branch:* \`${gitBranch}\`` +
-          `\n\n🚀 *Unlimited permissions enabled* - I can edit files and run commands without asking\n\n💬 What would you like me to help you with?`;
+          `\n\n🔐 *Choose permission mode:*`;
 
         const welcomeMessageResult = await this.app.client.chat.postMessage({
           token: config.slack.botToken,
           channel: channel,
           thread_ts: threadTs,
           text: welcomeText,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: welcomeText,
+              }
+            },
+            {
+              type: 'actions',
+              elements: [
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '🚀 Unlimited Permissions (Recommended)',
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    skipPermissions: true,
+                  }),
+                  action_id: 'set_unlimited_permissions',
+                  style: 'primary',
+                },
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '🛡️ Ask for Each Permission',
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    skipPermissions: false,
+                  }),
+                  action_id: 'set_ask_permissions',
+                }
+              ]
+            }
+          ]
         });
 
         // Store the welcome message timestamp
@@ -1617,51 +1660,7 @@ export class SlackHandler {
           this.threadWelcomeMessage.set(threadKey, welcomeMessageResult.ts);
         }
 
-        // Automatically set unlimited permissions and process pending message
-        let session = this.claudeHandler.getSession(user, channel, threadTs);
-        if (!session) {
-          session = this.claudeHandler.createSession(user, channel, threadTs);
-        }
-        session.skipPermissions = true;
-
-        this.logger.info('Session created with unlimited permissions', {
-          sessionKey: this.claudeHandler.getSessionKey(user, channel, threadTs),
-          skipPermissions: true,
-        });
-
-        // Check if there's a pending message to process
-        const threadKey = `${channel}-${threadTs}`;
-        const pendingMessage = this.pendingThreadMessages.get(threadKey);
-        if (pendingMessage) {
-          this.pendingThreadMessages.delete(threadKey);
-
-          // Get working directory
-          const workingDirectory = this.workingDirManager.getWorkingDirectory(channel, threadTs, channel.startsWith('D') ? user : undefined);
-
-          if (workingDirectory) {
-            // Process the pending message
-            const command = parseSessionCommand(pendingMessage);
-            this.messageQueue.enqueue(channel, threadTs, {
-              text: command.messageText || pendingMessage,
-              files: [],
-              timestamp: Date.now(),
-              isInterrupt: false,
-            });
-
-            // Create a say function for this thread
-            const say = async (message: any) => {
-              await this.app.client.chat.postMessage({
-                token: config.slack.botToken,
-                channel: channel,
-                thread_ts: threadTs,
-                ...message,
-              });
-            };
-
-            // Start processing the queue
-            this.processMessageQueue(user, channel, threadTs, workingDirectory, say);
-          }
-        }
+        // Permission selection will handle processing the pending message
       } catch (error) {
         this.logger.error('Failed to handle project selection', error);
         await respond({
