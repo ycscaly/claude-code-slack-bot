@@ -1436,17 +1436,107 @@ export class SlackHandler {
           ts: (body as any).message.ts,
         });
 
-        // Send welcome message with session info
+        // Send welcome message with session info and permission selection
         const welcomeText = formatSessionInfo(sessionName) +
           `\n\n📁 *Project:* \`${project}\`` +
           `\n🌿 *Branch:* \`${gitBranch}\`` +
-          `\n\n💬 What would you like me to help you with?`;
+          `\n\n🔐 *Choose permission mode:*`;
 
         await this.app.client.chat.postMessage({
           token: config.slack.botToken,
           channel: channel,
           thread_ts: threadTs,
           text: welcomeText,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: welcomeText,
+              }
+            },
+            {
+              type: 'actions',
+              elements: [
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '🚀 Unlimited Permissions',
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    skipPermissions: true,
+                  }),
+                  action_id: 'set_unlimited_permissions',
+                  style: 'primary',
+                },
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '🛡️ Ask for Each Permission',
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    skipPermissions: false,
+                  }),
+                  action_id: 'set_ask_permissions',
+                }
+              ]
+            }
+          ]
+        });
+
+        // Permission selection will handle processing the pending message
+      } catch (error) {
+        this.logger.error('Failed to handle project selection', error);
+        await respond({
+          response_type: 'ephemeral',
+          text: `❌ Failed to set working directory: ${(error as Error).message}`
+        });
+      }
+    });
+
+    // Handle permission mode selection
+    this.app.action(/^set_(unlimited|ask)_permissions$/, async ({ ack, body, respond }) => {
+      await ack();
+
+      try {
+        const action = (body as any).actions[0];
+        const data = JSON.parse(action.value);
+        const { channel, threadTs, user, skipPermissions } = data;
+
+        this.logger.info('Permission mode selected', { channel, threadTs, user, skipPermissions });
+
+        // Get or create session and set permission mode
+        let session = this.claudeHandler.getSession(user, channel, threadTs);
+        if (!session) {
+          session = this.claudeHandler.createSession(user, channel, threadTs);
+        }
+        session.skipPermissions = skipPermissions;
+
+        // Delete the permission selection message
+        await this.app.client.chat.delete({
+          token: config.slack.botToken,
+          channel: channel,
+          ts: (body as any).message.ts,
+        });
+
+        // Send confirmation
+        const confirmText = skipPermissions
+          ? `🚀 *Unlimited permissions enabled*\n\n💬 What would you like me to help you with?`
+          : `🛡️ *Permission prompts enabled* - I'll ask before running commands\n\n💬 What would you like me to help you with?`;
+
+        await this.app.client.chat.postMessage({
+          token: config.slack.botToken,
+          channel: channel,
+          thread_ts: threadTs,
+          text: confirmText,
         });
 
         // Check if there's a pending message to process
@@ -1455,33 +1545,38 @@ export class SlackHandler {
         if (pendingMessage) {
           this.pendingThreadMessages.delete(threadKey);
 
-          // Process the pending message
-          const command = parseSessionCommand(pendingMessage);
-          this.messageQueue.enqueue(channel, threadTs, {
-            text: command.messageText || pendingMessage,
-            files: [],
-            timestamp: Date.now(),
-            isInterrupt: false,
-          });
+          // Get working directory
+          const workingDirectory = this.workingDirManager.getWorkingDirectory(channel, threadTs, channel.startsWith('D') ? user : undefined);
 
-          // Create a say function for this thread
-          const say = async (message: any) => {
-            await this.app.client.chat.postMessage({
-              token: config.slack.botToken,
-              channel: channel,
-              thread_ts: threadTs,
-              ...message,
+          if (workingDirectory) {
+            // Process the pending message
+            const command = parseSessionCommand(pendingMessage);
+            this.messageQueue.enqueue(channel, threadTs, {
+              text: command.messageText || pendingMessage,
+              files: [],
+              timestamp: Date.now(),
+              isInterrupt: false,
             });
-          };
 
-          // Start processing the queue
-          this.processMessageQueue(user, channel, threadTs, projectPath, say);
+            // Create a say function for this thread
+            const say = async (message: any) => {
+              await this.app.client.chat.postMessage({
+                token: config.slack.botToken,
+                channel: channel,
+                thread_ts: threadTs,
+                ...message,
+              });
+            };
+
+            // Start processing the queue
+            this.processMessageQueue(user, channel, threadTs, workingDirectory, say);
+          }
         }
       } catch (error) {
-        this.logger.error('Failed to handle project selection', error);
+        this.logger.error('Failed to handle permission selection', error);
         await respond({
           response_type: 'ephemeral',
-          text: `❌ Failed to set working directory: ${(error as Error).message}`
+          text: `❌ Failed to set permission mode: ${(error as Error).message}`
         });
       }
     });

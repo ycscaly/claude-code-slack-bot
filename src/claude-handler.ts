@@ -42,7 +42,7 @@ export class ClaudeHandler {
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const options: any = {
       outputFormat: 'stream-json',
-      dangerouslySkipPermissions: true,
+      dangerouslySkipPermissions: session?.skipPermissions ?? true, // Default to true for backward compatibility
     };
 
     if (workingDirectory) {
