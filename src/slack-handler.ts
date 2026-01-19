@@ -1053,6 +1053,7 @@ export class SlackHandler {
       this.logger.info('Sending query to Claude Code SDK', {
         prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''),
         sessionId: session.sessionId,
+        skipPermissions: session.skipPermissions,
         workingDirectory,
         fileCount: processedFiles.length,
       });
@@ -1683,9 +1684,16 @@ export class SlackHandler {
         // Get or create session and set permission mode
         let session = this.claudeHandler.getSession(user, channel, threadTs);
         if (!session) {
+          this.logger.info('Creating new session for permission selection', { user, channel, threadTs });
           session = this.claudeHandler.createSession(user, channel, threadTs);
         }
         session.skipPermissions = skipPermissions;
+
+        this.logger.info('Session permission mode set', {
+          sessionKey: this.claudeHandler.getSessionKey(user, channel, threadTs),
+          skipPermissions: session.skipPermissions,
+          sessionId: session.sessionId,
+        });
 
         // Delete the permission selection message
         await this.app.client.chat.delete({
