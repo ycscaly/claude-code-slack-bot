@@ -45,6 +45,10 @@ export class SlackHandler {
   private botUserId: string | null = null;
   private tmuxManager: TmuxManager;
   private messageQueue: MessageQueue;
+  private threadMessageCount: Map<string, number> = new Map(); // threadKey -> message count
+  private threadMessageHistory: Map<string, Array<{role: string, content: string, ts: string}>> = new Map(); // threadKey -> full history
+  private threadSummaries: Map<string, string[]> = new Map(); // threadKey -> array of summaries
+  private threadWelcomeMessage: Map<string, string> = new Map(); // threadKey -> welcome message ts
 
   constructor(app: App, claudeHandler: ClaudeHandler, mcpManager: McpManager) {
     this.app = app;
@@ -88,6 +92,11 @@ export class SlackHandler {
 
     if (command.type === 'connect') {
       await this.handleConnectCommand(channel, thread_ts || ts, command.sessionName!, say);
+      return;
+    }
+
+    if (command.type === 'show_history') {
+      await this.handleShowHistoryCommand(channel, thread_ts || ts, say);
       return;
     }
 
@@ -1048,6 +1057,9 @@ export class SlackHandler {
         fileCount: processedFiles.length,
       });
 
+      // Track user message
+      this.trackMessage(channel, threadTs, 'user', text || '', threadTs);
+
       // Send initial status message
       const statusResult = await say({
         text: '🤔 *Thinking...*',
@@ -1097,10 +1109,13 @@ export class SlackHandler {
             // For other tool use messages, format them immediately as new messages
             const toolContent = this.formatToolUse(message.message.content);
             if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
-              await say({
+              const result = await say({
                 text: toolContent,
                 thread_ts: threadTs,
               });
+              if (result.ts) {
+                this.trackMessage(channel, threadTs, 'assistant', toolContent, result.ts);
+              }
             }
           } else {
             // Handle regular text content
@@ -1110,10 +1125,13 @@ export class SlackHandler {
 
               // Send each new piece of content as a separate message
               const formatted = this.formatMessage(content, false);
-              await say({
+              const result = await say({
                 text: formatted,
                 thread_ts: threadTs,
               });
+              if (result.ts) {
+                this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
+              }
             }
           }
         } else if (message.type === 'result') {
@@ -1128,10 +1146,13 @@ export class SlackHandler {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
               const formatted = this.formatMessage(finalResult, true);
-              await say({
+              const result = await say({
                 text: formatted,
                 thread_ts: threadTs,
               });
+              if (result.ts) {
+                this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
+              }
             }
           }
         }
@@ -1150,6 +1171,9 @@ export class SlackHandler {
         sessionKey,
         messageCount: currentMessages.length,
       });
+
+      // Check if we need to summarize
+      await this.checkAndSummarize(user, channel, threadTs);
 
       // Clean up temporary files
       if (processedFiles.length > 0) {
@@ -1320,6 +1344,143 @@ export class SlackHandler {
     this.logger.info('Connected to existing session', { sessionName, threadTs, workingDirectory: result.resolvedPath });
   }
 
+  private async handleShowHistoryCommand(channel: string, threadTs: string, say: any): Promise<void> {
+    const threadKey = `${channel}-${threadTs}`;
+    const history = this.threadMessageHistory.get(threadKey) || [];
+    const summaries = this.threadSummaries.get(threadKey) || [];
+
+    if (history.length === 0 && summaries.length === 0) {
+      await say({
+        text: '📜 No conversation history available yet.',
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    let historyText = '📜 *Full Conversation History*\n\n';
+
+    // Add summaries first
+    if (summaries.length > 0) {
+      historyText += '*Previous Summaries:*\n';
+      summaries.forEach((summary, index) => {
+        historyText += `\n*Summary ${index + 1}:*\n${summary}\n`;
+      });
+      historyText += '\n---\n\n';
+    }
+
+    // Add current messages
+    if (history.length > 0) {
+      historyText += '*Recent Messages:*\n\n';
+      history.forEach(msg => {
+        const roleIcon = msg.role === 'user' ? '👤' : '🤖';
+        historyText += `${roleIcon} **${msg.role}**: ${msg.content}\n\n`;
+      });
+    }
+
+    await say({
+      text: historyText,
+      thread_ts: threadTs,
+    });
+  }
+
+  private trackMessage(channel: string, threadTs: string, role: 'user' | 'assistant', content: string, ts: string): void {
+    const threadKey = `${channel}-${threadTs}`;
+
+    if (!this.threadMessageHistory.has(threadKey)) {
+      this.threadMessageHistory.set(threadKey, []);
+      this.threadMessageCount.set(threadKey, 0);
+    }
+
+    this.threadMessageHistory.get(threadKey)!.push({ role, content, ts });
+    const count = this.threadMessageCount.get(threadKey)! + 1;
+    this.threadMessageCount.set(threadKey, count);
+
+    this.logger.debug('Tracked message', { threadKey, role, count });
+  }
+
+  private async checkAndSummarize(user: string, channel: string, threadTs: string): Promise<void> {
+    const threadKey = `${channel}-${threadTs}`;
+    const count = this.threadMessageCount.get(threadKey) || 0;
+
+    // Summarize every 10 messages
+    if (count >= 10 && count % 10 === 0) {
+      await this.summarizeAndCleanup(user, channel, threadTs);
+    }
+  }
+
+  private async summarizeAndCleanup(user: string, channel: string, threadTs: string): Promise<void> {
+    const threadKey = `${channel}-${threadTs}`;
+    const history = this.threadMessageHistory.get(threadKey) || [];
+    const welcomeTs = this.threadWelcomeMessage.get(threadKey);
+
+    if (history.length === 0) {
+      return;
+    }
+
+    this.logger.info('Creating summary for thread', { threadKey, messageCount: history.length });
+
+    try {
+      // Create a prompt for Claude to summarize
+      const conversationText = history.map(msg => `${msg.role}: ${msg.content}`).join('\n\n');
+      const summaryPrompt = `Please summarize the following conversation in a short paragraph (2-3 sentences). Focus on what work was accomplished and key decisions made:\n\n${conversationText}`;
+
+      // Get Claude session
+      const session = this.claudeHandler.getSession(user, channel, threadTs);
+      const workingDirectory = this.workingDirManager.getWorkingDirectory(channel, threadTs, channel.startsWith('D') ? user : undefined);
+
+      // Ask Claude for summary
+      let summaryText = '';
+      for await (const message of this.claudeHandler.streamQuery(summaryPrompt, session, undefined, workingDirectory)) {
+        if (message.type === 'assistant' && message.message?.content) {
+          for (const content of message.message.content) {
+            if (content.type === 'text') {
+              summaryText += content.text;
+            }
+          }
+        }
+      }
+
+      if (summaryText) {
+        // Store the summary
+        if (!this.threadSummaries.has(threadKey)) {
+          this.threadSummaries.set(threadKey, []);
+        }
+        this.threadSummaries.get(threadKey)!.push(summaryText.trim());
+
+        // Post the summary
+        await this.app.client.chat.postMessage({
+          token: config.slack.botToken,
+          channel: channel,
+          thread_ts: threadTs,
+          text: `📝 *Summary of last 10 messages:*\n\n${summaryText.trim()}\n\n_Use ${SESSION_COMMANDS.SHOW_HISTORY} to see full history_`,
+        });
+
+        // Delete old messages (keep welcome message)
+        const messagesToDelete = history.map(msg => msg.ts);
+        for (const ts of messagesToDelete) {
+          if (ts !== welcomeTs) {
+            try {
+              await this.app.client.chat.delete({
+                token: config.slack.botToken,
+                channel: channel,
+                ts: ts,
+              });
+            } catch (error) {
+              this.logger.warn('Failed to delete message', { ts, error });
+            }
+          }
+        }
+
+        // Clear current history but keep summaries
+        this.threadMessageHistory.set(threadKey, []);
+
+        this.logger.info('Successfully summarized and cleaned up thread', { threadKey });
+      }
+    } catch (error) {
+      this.logger.error('Failed to create summary', { threadKey, error });
+    }
+  }
+
   private formatAvailableSessions(): string {
     const sessions = this.tmuxManager.getAllSessions();
     if (sessions.length === 0) {
@@ -1442,7 +1603,7 @@ export class SlackHandler {
           `\n🌿 *Branch:* \`${gitBranch}\`` +
           `\n\n🔐 *Choose permission mode:*`;
 
-        await this.app.client.chat.postMessage({
+        const welcomeMessageResult = await this.app.client.chat.postMessage({
           token: config.slack.botToken,
           channel: channel,
           thread_ts: threadTs,
@@ -1491,6 +1652,12 @@ export class SlackHandler {
             }
           ]
         });
+
+        // Store the welcome message timestamp
+        if (welcomeMessageResult.ts) {
+          const threadKey = `${channel}-${threadTs}`;
+          this.threadWelcomeMessage.set(threadKey, welcomeMessageResult.ts);
+        }
 
         // Permission selection will handle processing the pending message
       } catch (error) {

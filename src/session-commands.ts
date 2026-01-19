@@ -4,6 +4,7 @@ export const SESSION_COMMANDS = {
   COMPLETE_DELETE: '🗑️',
   COMPLETE_KEEP: '✅',
   CONNECT: '🔌',
+  SHOW_HISTORY: '📜',
 } as const;
 
 // Slack text representations of emojis
@@ -12,10 +13,11 @@ const SLACK_EMOJI_TEXT = {
   COMPLETE_DELETE: ':wastebasket:',
   COMPLETE_KEEP: ':white_check_mark:',
   CONNECT: ':electric_plug:',
+  SHOW_HISTORY: ':scroll:',
 } as const;
 
 export interface ParsedCommand {
-  type: 'interrupt' | 'complete_delete' | 'complete_keep' | 'connect' | 'normal';
+  type: 'interrupt' | 'complete_delete' | 'complete_keep' | 'connect' | 'show_history' | 'normal';
   sessionName?: string; // For connect command
   messageText: string; // Text without the command prefix
 }
@@ -73,6 +75,17 @@ export function parseSessionCommand(text: string): ParsedCommand {
     };
   }
 
+  // Check for show history (both emoji and Slack text)
+  if (trimmed.startsWith(SESSION_COMMANDS.SHOW_HISTORY) || trimmed.startsWith(SLACK_EMOJI_TEXT.SHOW_HISTORY)) {
+    const prefix = trimmed.startsWith(SESSION_COMMANDS.SHOW_HISTORY)
+      ? SESSION_COMMANDS.SHOW_HISTORY
+      : SLACK_EMOJI_TEXT.SHOW_HISTORY;
+    return {
+      type: 'show_history',
+      messageText: trimmed.substring(prefix.length).trim(),
+    };
+  }
+
   // Normal message
   return {
     type: 'normal',
@@ -87,5 +100,6 @@ export function formatSessionInfo(sessionName: string): string {
     `• ${SESSION_COMMANDS.INTERRUPT} or \`${SLACK_EMOJI_TEXT.INTERRUPT}\` - Interrupt current execution\n` +
     `• ${SESSION_COMMANDS.COMPLETE_DELETE} or \`${SLACK_EMOJI_TEXT.COMPLETE_DELETE}\` - Complete & delete thread\n` +
     `• ${SESSION_COMMANDS.COMPLETE_KEEP} or \`${SLACK_EMOJI_TEXT.COMPLETE_KEEP}\` - Complete & keep thread\n` +
-    `• ${SESSION_COMMANDS.CONNECT} or \`${SLACK_EMOJI_TEXT.CONNECT}\` session_name - Connect to existing session`;
+    `• ${SESSION_COMMANDS.CONNECT} or \`${SLACK_EMOJI_TEXT.CONNECT}\` session_name - Connect to existing session\n` +
+    `• ${SESSION_COMMANDS.SHOW_HISTORY} or \`${SLACK_EMOJI_TEXT.SHOW_HISTORY}\` - Show full conversation history`;
 }
