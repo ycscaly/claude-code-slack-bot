@@ -220,24 +220,29 @@ export class PermissionMCPServer {
       }
 
       // Return the response in a format Claude Code SDK can understand
-      const responseText = response.behavior === 'allow' ? 'APPROVED' : 'DENIED';
-
       log("INFO", 'Returning permission response to Claude Code SDK', {
         approvalId,
         behavior: response.behavior,
-        responseText,
         fullResponse: response
       });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: responseText
-          }
-        ],
-        isError: response.behavior === 'deny'
-      };
+      // For approval: return empty content (permission granted, proceed)
+      // For denial: return error with message (permission denied, block)
+      if (response.behavior === 'allow') {
+        return {
+          content: []
+        };
+      } else {
+        return {
+          content: [
+            {
+              type: "text",
+              text: response.message || 'Permission denied by user'
+            }
+          ],
+          isError: true
+        };
+      }
     } catch (error) {
       log("ERROR", 'Error handling permission prompt:', error);
 

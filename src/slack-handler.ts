@@ -100,6 +100,13 @@ export class SlackHandler {
       return;
     }
 
+    // Check if this is a scroll history command (📜 followed by number)
+    if (text && this.isScrollHistoryCommand(text)) {
+      const count = this.parseScrollHistoryCount(text);
+      await this.handleScrollHistoryCommand(channel, thread_ts || ts, count, say);
+      return;
+    }
+
     this.logger.debug('Received message from Slack', {
       user,
       channel,
@@ -1108,32 +1115,34 @@ export class SlackHandler {
             }
 
             // For other tool use messages, format them immediately as new messages
-            const toolContent = this.formatToolUse(message.message.content);
-            if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
-              const result = await say({
-                text: toolContent,
-                thread_ts: threadTs,
-              });
-              if (result.ts) {
-                this.trackMessage(channel, threadTs, 'assistant', toolContent, result.ts);
-              }
-            }
+            // DISABLED: Only show permission requests and completion messages
+            // const toolContent = this.formatToolUse(message.message.content);
+            // if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
+            //   const result = await say({
+            //     text: toolContent,
+            //     thread_ts: threadTs,
+            //   });
+            //   if (result.ts) {
+            //     this.trackMessage(channel, threadTs, 'assistant', toolContent, result.ts);
+            //   }
+            // }
           } else {
             // Handle regular text content
-            const content = this.extractTextContent(message);
-            if (content) {
-              currentMessages.push(content);
+            // DISABLED: Only show permission requests and completion messages
+            // const content = this.extractTextContent(message);
+            // if (content) {
+            //   currentMessages.push(content);
 
-              // Send each new piece of content as a separate message
-              const formatted = this.formatMessage(content, false);
-              const result = await say({
-                text: formatted,
-                thread_ts: threadTs,
-              });
-              if (result.ts) {
-                this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
-              }
-            }
+            //   // Send each new piece of content as a separate message
+            //   const formatted = this.formatMessage(content, false);
+            //   const result = await say({
+            //     text: formatted,
+            //     thread_ts: threadTs,
+            //   });
+            //   if (result.ts) {
+            //     this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
+            //   }
+            // }
           }
         } else if (message.type === 'result') {
           this.logger.info('Received result from Claude SDK', {
@@ -1143,19 +1152,20 @@ export class SlackHandler {
             duration: (message as any).duration_ms,
           });
 
-          if (message.subtype === 'success' && (message as any).result) {
-            const finalResult = (message as any).result;
-            if (finalResult && !currentMessages.includes(finalResult)) {
-              const formatted = this.formatMessage(finalResult, true);
-              const result = await say({
-                text: formatted,
-                thread_ts: threadTs,
-              });
-              if (result.ts) {
-                this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
-              }
-            }
-          }
+          // DISABLED: Only show permission requests and completion messages
+          // if (message.subtype === 'success' && (message as any).result) {
+          //   const finalResult = (message as any).result;
+          //   if (finalResult && !currentMessages.includes(finalResult)) {
+          //     const formatted = this.formatMessage(finalResult, true);
+          //     const result = await say({
+          //       text: formatted,
+          //       thread_ts: threadTs,
+          //     });
+          //     if (result.ts) {
+          //       this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
+          //     }
+          //   }
+          // }
         }
       }
 
@@ -1695,23 +1705,20 @@ export class SlackHandler {
           sessionId: session.sessionId,
         });
 
-        // Delete the permission selection message
-        await this.app.client.chat.delete({
+        // Get the original welcome message text and update it (don't delete it)
+        const originalMessage = (body as any).message;
+        const originalText = originalMessage.blocks?.[0]?.text?.text || originalMessage.text;
+
+        // Update the message to remove buttons and add permission confirmation
+        const permissionNote = skipPermissions
+          ? `\n\n🚀 *Unlimited permissions enabled*\n\n💬 What would you like me to help you with?`
+          : `\n\n🛡️ *Permission prompts enabled* - I'll ask before each action\n\n💬 What would you like me to help you with?`;
+
+        await this.app.client.chat.update({
           token: config.slack.botToken,
           channel: channel,
           ts: (body as any).message.ts,
-        });
-
-        // Send confirmation
-        const confirmText = skipPermissions
-          ? `🚀 *Unlimited permissions enabled*\n\n💬 What would you like me to help you with?`
-          : `🛡️ *Permission prompts enabled*\n\n⚠️ *Note:* Permission approval via Slack buttons is experimental. If you encounter issues with file editing, please start a new session with unlimited permissions.\n\n💬 What would you like me to help you with?`;
-
-        await this.app.client.chat.postMessage({
-          token: config.slack.botToken,
-          channel: channel,
-          thread_ts: threadTs,
-          text: confirmText,
+          text: originalText + permissionNote,
         });
 
         // Check if there's a pending message to process
@@ -1761,5 +1768,60 @@ export class SlackHandler {
       this.logger.debug('Running session cleanup');
       this.claudeHandler.cleanupInactiveSessions();
     }, 5 * 60 * 1000); // Every 5 minutes
+  }
+
+  private isScrollHistoryCommand(text: string): boolean {
+    // Match scroll emoji (📜) followed by optional space and a number
+    return /📜\s*\d+/.test(text.trim());
+  }
+
+  private parseScrollHistoryCount(text: string): number {
+    const match = text.trim().match(/📜\s*(\d+)/);
+    return match ? parseInt(match[1], 10) : 10; // Default to 10 if no match
+  }
+
+  private async handleScrollHistoryCommand(
+    channel: string,
+    threadTs: string,
+    count: number,
+    say: any
+  ): Promise<void> {
+    const threadKey = `${channel}-${threadTs}`;
+    const history = this.threadMessageHistory.get(threadKey) || [];
+
+    if (history.length === 0) {
+      await say({
+        text: '📜 No message history found for this thread.',
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    // Get the last X messages
+    const lastMessages = history.slice(-count);
+
+    // Format the messages
+    let formatted = `📜 *Last ${lastMessages.length} message(s):*\n\n`;
+
+    for (const msg of lastMessages) {
+      const roleIcon = msg.role === 'user' ? '👤' : '🤖';
+      const preview = msg.content.length > 200
+        ? msg.content.substring(0, 200) + '...'
+        : msg.content;
+
+      formatted += `${roleIcon} **${msg.role}**:\n${preview}\n\n`;
+    }
+
+    await say({
+      text: formatted,
+      thread_ts: threadTs,
+    });
+
+    this.logger.info('Displayed scroll history', {
+      threadKey,
+      requestedCount: count,
+      actualCount: lastMessages.length,
+      totalMessages: history.length
+    });
   }
 }
