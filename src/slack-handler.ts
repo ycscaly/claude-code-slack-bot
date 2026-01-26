@@ -1669,23 +1669,173 @@ export class SlackHandler {
           ts: (body as any).message.ts,
         });
 
-        // Send welcome message with session info and permission selection
-        const welcomeText = formatSessionInfo(sessionName) +
+        // Base welcome text with project info
+        const baseWelcomeText = formatSessionInfo(sessionName) +
           `\n\n📁 *Project:* \`${project}\`` +
-          `\n🌿 *Branch:* \`${gitBranch}\`` +
-          `\n\n🔐 *Choose permission mode:*`;
+          `\n🌿 *Branch:* \`${gitBranch}\``;
 
-        const welcomeMessageResult = await this.app.client.chat.postMessage({
+        // Check if aliases are configured
+        const aliases = config.claude.aliases;
+
+        if (aliases.length > 0) {
+          // Show alias selection first
+          const aliasWelcomeText = baseWelcomeText + `\n\n🏷️ *Select which alias to use:*`;
+
+          const welcomeMessageResult = await this.app.client.chat.postMessage({
+            token: config.slack.botToken,
+            channel: channel,
+            thread_ts: threadTs,
+            text: aliasWelcomeText,
+            blocks: [
+              {
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: aliasWelcomeText,
+                }
+              },
+              {
+                type: 'actions',
+                elements: aliases.map((alias: string) => ({
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: `claude-${alias}`,
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    alias,
+                  }),
+                  action_id: `select_alias_${alias}`,
+                }))
+              }
+            ]
+          });
+
+          // Store the welcome message timestamp
+          if (welcomeMessageResult.ts) {
+            const threadKey = `${channel}-${threadTs}`;
+            this.threadWelcomeMessage.set(threadKey, welcomeMessageResult.ts);
+          }
+        } else {
+          // No aliases configured, go directly to permission selection
+          const welcomeText = baseWelcomeText + `\n\n🔐 *Choose permission mode:*`;
+
+          const welcomeMessageResult = await this.app.client.chat.postMessage({
+            token: config.slack.botToken,
+            channel: channel,
+            thread_ts: threadTs,
+            text: welcomeText,
+            blocks: [
+              {
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: welcomeText,
+                }
+              },
+              {
+                type: 'actions',
+                elements: [
+                  {
+                    type: 'button',
+                    text: {
+                      type: 'plain_text',
+                      text: '🚀 Unlimited Permissions (Recommended)',
+                    },
+                    value: JSON.stringify({
+                      channel,
+                      threadTs,
+                      user,
+                      skipPermissions: true,
+                    }),
+                    action_id: 'set_unlimited_permissions',
+                    style: 'primary',
+                  },
+                  {
+                    type: 'button',
+                    text: {
+                      type: 'plain_text',
+                      text: '🛡️ Ask for Each Permission',
+                    },
+                    value: JSON.stringify({
+                      channel,
+                      threadTs,
+                      user,
+                      skipPermissions: false,
+                    }),
+                    action_id: 'set_ask_permissions',
+                  }
+                ]
+              }
+            ]
+          });
+
+          // Store the welcome message timestamp
+          if (welcomeMessageResult.ts) {
+            const threadKey = `${channel}-${threadTs}`;
+            this.threadWelcomeMessage.set(threadKey, welcomeMessageResult.ts);
+          }
+        }
+
+        // Alias or permission selection will handle processing the pending message
+      } catch (error) {
+        this.logger.error('Failed to handle project selection', error);
+        await respond({
+          response_type: 'ephemeral',
+          text: `❌ Failed to set working directory: ${(error as Error).message}`
+        });
+      }
+    });
+
+    // Handle alias selection
+    this.app.action(/^select_alias_/, async ({ ack, body, respond }) => {
+      await ack();
+
+      try {
+        const action = (body as any).actions[0];
+        const data = JSON.parse(action.value);
+        const { channel, threadTs, user, alias } = data;
+
+        this.logger.info('Alias selected', { channel, threadTs, user, alias });
+
+        // Get or create session and set alias
+        let session = this.claudeHandler.getSession(user, channel, threadTs);
+        if (!session) {
+          this.logger.info('Creating new session for alias selection', { user, channel, threadTs });
+          session = this.claudeHandler.createSession(user, channel, threadTs);
+        }
+        session.alias = alias;
+
+        this.logger.info('Session alias set', {
+          sessionKey: this.claudeHandler.getSessionKey(user, channel, threadTs),
+          alias: session.alias,
+        });
+
+        // Get the original welcome message text and update it to show permission selection
+        const originalMessage = (body as any).message;
+        const originalText = originalMessage.blocks?.[0]?.text?.text || originalMessage.text;
+
+        // Remove the alias selection prompt and add alias confirmation + permission prompt
+        const aliasNote = `\n\n🏷️ *Using alias:* \`claude-${alias}\``;
+        const permissionPrompt = `\n\n🔐 *Choose permission mode:*`;
+
+        // Extract base text (remove the alias selection prompt)
+        const baseText = originalText.replace(/\n\n🏷️ \*Select which alias to use:\*$/, '');
+
+        await this.app.client.chat.update({
           token: config.slack.botToken,
           channel: channel,
-          thread_ts: threadTs,
-          text: welcomeText,
+          ts: (body as any).message.ts,
+          text: baseText + aliasNote + permissionPrompt,
           blocks: [
             {
               type: 'section',
               text: {
                 type: 'mrkdwn',
-                text: welcomeText,
+                text: baseText + aliasNote + permissionPrompt,
               }
             },
             {
@@ -1724,19 +1874,11 @@ export class SlackHandler {
             }
           ]
         });
-
-        // Store the welcome message timestamp
-        if (welcomeMessageResult.ts) {
-          const threadKey = `${channel}-${threadTs}`;
-          this.threadWelcomeMessage.set(threadKey, welcomeMessageResult.ts);
-        }
-
-        // Permission selection will handle processing the pending message
       } catch (error) {
-        this.logger.error('Failed to handle project selection', error);
+        this.logger.error('Failed to handle alias selection', error);
         await respond({
           response_type: 'ephemeral',
-          text: `❌ Failed to set working directory: ${(error as Error).message}`
+          text: `❌ Failed to set alias: ${(error as Error).message}`
         });
       }
     });

@@ -64,6 +64,12 @@ export class ClaudeHandler {
       options.cwd = workingDirectory;
     }
 
+    // Add profile/alias if specified
+    if (session?.alias) {
+      options.profile = `claude-${session.alias}`;
+      this.logger.debug('Using profile', { profile: options.profile });
+    }
+
     // Add plan mode if requested
     if (usePlanMode) {
       options.planMode = true;

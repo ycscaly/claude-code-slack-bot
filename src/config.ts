@@ -14,6 +14,7 @@ export const config = {
   claude: {
     useBedrock: process.env.CLAUDE_CODE_USE_BEDROCK === '1',
     useVertex: process.env.CLAUDE_CODE_USE_VERTEX === '1',
+    aliases: process.env.CLAUDE_ALIASES ? process.env.CLAUDE_ALIASES.split(',').map(a => a.trim()) : [],
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
   projectsDirectory: process.env.PROJECTS_DIRECTORY || '/mnt/nvme0n1p1/',

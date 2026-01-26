@@ -6,6 +6,7 @@ export interface ConversationSession {
   isActive: boolean;
   lastActivity: Date;
   workingDirectory?: string;
+  alias?: string; // Claude alias to use (e.g., 'yehonatan' -> 'claude-yehonatan')
   skipPermissions?: boolean;
   usePlanMode?: boolean;
   executionThreadTs?: string; // Thread for normal mode execution (separate from plan thread)
