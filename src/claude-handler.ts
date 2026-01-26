@@ -38,7 +38,8 @@ export class ClaudeHandler {
     session?: ConversationSession,
     abortController?: AbortController,
     workingDirectory?: string,
-    slackContext?: { channel: string; threadTs?: string; user: string }
+    slackContext?: { channel: string; threadTs?: string; user: string },
+    usePlanMode?: boolean
   ): AsyncGenerator<SDKMessage, void, unknown> {
     // Determine if we should skip permissions
     const shouldSkipPermissions = session?.skipPermissions ?? true;
@@ -61,6 +62,12 @@ export class ClaudeHandler {
 
     if (workingDirectory) {
       options.cwd = workingDirectory;
+    }
+
+    // Add plan mode if requested
+    if (usePlanMode) {
+      options.planMode = true;
+      this.logger.debug('Plan mode enabled');
     }
 
     // Add MCP server configuration if available

@@ -1082,7 +1082,38 @@ export class SlackHandler {
         user
       };
 
-      for await (const message of this.claudeHandler.streamQuery(finalPrompt, session, abortController, workingDirectory, slackContext)) {
+      // Determine which thread to post messages to
+      let currentThreadTs = threadTs;
+      let executionThreadTs: string | undefined;
+
+      // If not using plan mode, create execution thread immediately
+      if (!session.usePlanMode) {
+        const sessionName = this.tmuxManager.getSession(channel, threadTs);
+        const executionMessage = await this.app.client.chat.postMessage({
+          token: config.slack.botToken,
+          channel: channel,
+          text: `🚀 *Execution: ${sessionName}*\n\nThis thread contains the execution output.`,
+        });
+
+        executionThreadTs = executionMessage.ts as string;
+        currentThreadTs = executionThreadTs;
+
+        // Store execution thread in session
+        if (session) {
+          session.executionThreadTs = executionThreadTs;
+        }
+
+        this.logger.info('Created execution thread for non-plan mode', { executionThreadTs });
+      }
+
+      for await (const message of this.claudeHandler.streamQuery(
+        finalPrompt,
+        session,
+        abortController,
+        workingDirectory,
+        slackContext,
+        session.inPlanMode
+      )) {
         if (abortController.signal.aborted) break;
 
         this.logger.debug('Received message from Claude SDK', {
@@ -1090,6 +1121,31 @@ export class SlackHandler {
           subtype: (message as any).subtype,
           message: message,
         });
+
+        // Check if plan mode has exited
+        if (message.type === 'system' && (message as any).subtype === 'plan_exit') {
+          this.logger.info('Plan mode exited, creating execution thread', { threadTs });
+
+          // Create a new thread for execution
+          const sessionName = this.tmuxManager.getSession(channel, threadTs);
+          const executionMessage = await this.app.client.chat.postMessage({
+            token: config.slack.botToken,
+            channel: channel,
+            text: `🚀 *Executing Plan: ${sessionName}*\n\nThis thread contains the execution output.`,
+          });
+
+          executionThreadTs = executionMessage.ts as string;
+          currentThreadTs = executionThreadTs;
+
+          // Store execution thread in session
+          if (session) {
+            session.executionThreadTs = executionThreadTs;
+            session.inPlanMode = false;
+          }
+
+          this.logger.info('Created execution thread', { executionThreadTs });
+          continue; // Skip processing this message
+        }
 
         if (message.type === 'assistant') {
           // Check if this is a tool use message
@@ -1114,35 +1170,37 @@ export class SlackHandler {
               await this.handleTodoUpdate(todoTool.input, sessionKey, session?.sessionId, channel, threadTs, say);
             }
 
-            // For other tool use messages, format them immediately as new messages
-            // DISABLED: Only show permission requests and completion messages
-            // const toolContent = this.formatToolUse(message.message.content);
-            // if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
-            //   const result = await say({
-            //     text: toolContent,
-            //     thread_ts: threadTs,
-            //   });
-            //   if (result.ts) {
-            //     this.trackMessage(channel, threadTs, 'assistant', toolContent, result.ts);
-            //   }
-            // }
+            // For other tool use messages, always show in the current thread
+            const toolContent = this.formatToolUse(message.message.content);
+            if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
+              const result = await this.app.client.chat.postMessage({
+                token: config.slack.botToken,
+                channel: channel,
+                thread_ts: currentThreadTs,
+                text: toolContent,
+              });
+              if (result.ts) {
+                this.trackMessage(channel, currentThreadTs, 'assistant', toolContent, result.ts as string);
+              }
+            }
           } else {
-            // Handle regular text content
-            // DISABLED: Only show permission requests and completion messages
-            // const content = this.extractTextContent(message);
-            // if (content) {
-            //   currentMessages.push(content);
+            // Handle regular text content - always show in the current thread
+            const content = this.extractTextContent(message);
+            if (content) {
+              currentMessages.push(content);
 
-            //   // Send each new piece of content as a separate message
-            //   const formatted = this.formatMessage(content, false);
-            //   const result = await say({
-            //     text: formatted,
-            //     thread_ts: threadTs,
-            //   });
-            //   if (result.ts) {
-            //     this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
-            //   }
-            // }
+              // Send each new piece of content as a separate message
+              const formatted = this.formatMessage(content, false);
+              const result = await this.app.client.chat.postMessage({
+                token: config.slack.botToken,
+                channel: channel,
+                thread_ts: currentThreadTs,
+                text: formatted,
+              });
+              if (result.ts) {
+                this.trackMessage(channel, currentThreadTs, 'assistant', formatted, result.ts as string);
+              }
+            }
           }
         } else if (message.type === 'result') {
           this.logger.info('Received result from Claude SDK', {
@@ -1152,20 +1210,22 @@ export class SlackHandler {
             duration: (message as any).duration_ms,
           });
 
-          // DISABLED: Only show permission requests and completion messages
-          // if (message.subtype === 'success' && (message as any).result) {
-          //   const finalResult = (message as any).result;
-          //   if (finalResult && !currentMessages.includes(finalResult)) {
-          //     const formatted = this.formatMessage(finalResult, true);
-          //     const result = await say({
-          //       text: formatted,
-          //       thread_ts: threadTs,
-          //     });
-          //     if (result.ts) {
-          //       this.trackMessage(channel, threadTs, 'assistant', formatted, result.ts);
-          //     }
-          //   }
-          // }
+          // Show final result in the current thread
+          if (message.subtype === 'success' && (message as any).result) {
+            const finalResult = (message as any).result;
+            if (finalResult && !currentMessages.includes(finalResult)) {
+              const formatted = this.formatMessage(finalResult, true);
+              const result = await this.app.client.chat.postMessage({
+                token: config.slack.botToken,
+                channel: channel,
+                thread_ts: currentThreadTs,
+                text: formatted,
+              });
+              if (result.ts) {
+                this.trackMessage(channel, currentThreadTs, 'assistant', formatted, result.ts as string);
+              }
+            }
+          }
         }
       }
 
@@ -1181,10 +1241,11 @@ export class SlackHandler {
       this.logger.info('Completed processing message', {
         sessionKey,
         messageCount: currentMessages.length,
+        executionThreadTs,
       });
 
-      // Check if we need to summarize
-      await this.checkAndSummarize(user, channel, threadTs);
+      // Check if we need to summarize (use execution thread if it was created)
+      await this.checkAndSummarize(user, channel, executionThreadTs || threadTs);
 
       // Clean up temporary files
       if (processedFiles.length > 0) {
@@ -1709,16 +1770,117 @@ export class SlackHandler {
         const originalMessage = (body as any).message;
         const originalText = originalMessage.blocks?.[0]?.text?.text || originalMessage.text;
 
-        // Update the message to remove buttons and add permission confirmation
+        // Update the message to show permission confirmation and ask about plan mode
         const permissionNote = skipPermissions
-          ? `\n\n🚀 *Unlimited permissions enabled*\n\n💬 What would you like me to help you with?`
-          : `\n\n🛡️ *Permission prompts enabled* - I'll ask before each action\n\n💬 What would you like me to help you with?`;
+          ? `\n\n🚀 *Unlimited permissions enabled*`
+          : `\n\n🛡️ *Permission prompts enabled* - I'll ask before each action`;
+
+        const planModePrompt = `\n\n🎯 *Would you like to use plan mode?*`;
 
         await this.app.client.chat.update({
           token: config.slack.botToken,
           channel: channel,
           ts: (body as any).message.ts,
-          text: originalText + permissionNote,
+          text: originalText + permissionNote + planModePrompt,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: originalText + permissionNote + planModePrompt,
+              }
+            },
+            {
+              type: 'actions',
+              elements: [
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '🎯 Use Plan Mode',
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    usePlanMode: true,
+                  }),
+                  action_id: 'set_plan_mode',
+                  style: 'primary',
+                },
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '🚀 Skip Plan Mode',
+                  },
+                  value: JSON.stringify({
+                    channel,
+                    threadTs,
+                    user,
+                    usePlanMode: false,
+                  }),
+                  action_id: 'skip_plan_mode',
+                }
+              ]
+            }
+          ]
+        });
+
+        // Pending message will be processed after plan mode selection
+      } catch (error) {
+        this.logger.error('Failed to handle permission selection', error);
+        await respond({
+          response_type: 'ephemeral',
+          text: `❌ Failed to set permission mode: ${(error as Error).message}`
+        });
+      }
+    });
+
+    // Handle plan mode selection
+    this.app.action(/^(set_plan_mode|skip_plan_mode)$/, async ({ ack, body, respond }) => {
+      await ack();
+
+      try {
+        const action = (body as any).actions[0];
+        const data = JSON.parse(action.value);
+        const { channel, threadTs, user, usePlanMode } = data;
+
+        this.logger.info('Plan mode selection', { channel, threadTs, user, usePlanMode });
+
+        // Get session and set plan mode preference
+        let session = this.claudeHandler.getSession(user, channel, threadTs);
+        if (!session) {
+          this.logger.error('Session not found for plan mode selection', { user, channel, threadTs });
+          await respond({
+            response_type: 'ephemeral',
+            text: `❌ Session not found. Please try again.`
+          });
+          return;
+        }
+
+        session.usePlanMode = usePlanMode;
+        session.inPlanMode = usePlanMode; // Start in plan mode if enabled
+
+        this.logger.info('Session plan mode set', {
+          sessionKey: this.claudeHandler.getSessionKey(user, channel, threadTs),
+          usePlanMode: session.usePlanMode,
+          inPlanMode: session.inPlanMode,
+        });
+
+        // Update the message to remove buttons and show final configuration
+        const originalMessage = (body as any).message;
+        const originalText = originalMessage.blocks?.[0]?.text?.text || originalMessage.text;
+
+        const planModeNote = usePlanMode
+          ? `\n\n🎯 *Plan mode enabled* - I'll create a plan first, then execute in a separate thread\n\n💬 What would you like me to help you with?`
+          : `\n\n🚀 *Plan mode skipped* - I'll start working immediately\n\n💬 What would you like me to help you with?`;
+
+        await this.app.client.chat.update({
+          token: config.slack.botToken,
+          channel: channel,
+          ts: (body as any).message.ts,
+          text: originalText + planModeNote,
         });
 
         // Check if there's a pending message to process
@@ -1734,7 +1896,7 @@ export class SlackHandler {
             // Process the pending message
             const command = parseSessionCommand(pendingMessage);
             this.messageQueue.enqueue(channel, threadTs, {
-              text: command.messageText || pendingMessage,
+              text: command.messageText,
               files: [],
               timestamp: Date.now(),
               isInterrupt: false,
@@ -1755,10 +1917,10 @@ export class SlackHandler {
           }
         }
       } catch (error) {
-        this.logger.error('Failed to handle permission selection', error);
+        this.logger.error('Failed to handle plan mode selection', error);
         await respond({
           response_type: 'ephemeral',
-          text: `❌ Failed to set permission mode: ${(error as Error).message}`
+          text: `❌ Failed to set plan mode: ${(error as Error).message}`
         });
       }
     });

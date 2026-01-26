@@ -7,6 +7,9 @@ export interface ConversationSession {
   lastActivity: Date;
   workingDirectory?: string;
   skipPermissions?: boolean;
+  usePlanMode?: boolean;
+  executionThreadTs?: string; // Thread for normal mode execution (separate from plan thread)
+  inPlanMode?: boolean; // Currently in plan mode
 }
 
 export interface WorkingDirectoryConfig {
