@@ -135,51 +135,54 @@ export class ClaudeHandler {
       options.planMode = true;
       this.logger.debug('Plan mode enabled');
 
-      // Add hook to intercept ExitPlanMode tool for user approval
+      // Use canUseTool to intercept ExitPlanMode for user approval
       if (slackContext && onPlanApprovalRequest) {
         const sessionKey = session ? this.getSessionKey(session.userId, session.channelId, session.threadTs) : 'unknown';
+        const self = this;
 
-        options.hooks = {
-          PreToolUse: [{
-            matcher: 'ExitPlanMode',
-            hooks: [async (input: any, toolUseId: string | undefined, hookOptions: { signal: AbortSignal }) => {
-              this.logger.info('ExitPlanMode tool intercepted, requesting user approval', {
-                sessionKey,
-                plan: input.plan?.substring(0, 200)
-              });
+        options.canUseTool = async (
+          toolName: string,
+          input: any,
+          toolOptions: { signal: AbortSignal; suggestions?: any[] }
+        ) => {
+          // Only intercept ExitPlanMode
+          if (toolName !== 'ExitPlanMode') {
+            return {
+              behavior: 'allow',
+              updatedInput: input
+            };
+          }
 
-              // Create approval request
-              const approvalId = this.createPlanApprovalRequest(sessionKey);
+          self.logger.info('ExitPlanMode tool intercepted via canUseTool, requesting user approval', {
+            sessionKey,
+            plan: input.plan?.substring(0, 200)
+          });
 
-              // Notify slack-handler to show approval UI
-              await onPlanApprovalRequest(input.plan || 'No plan provided', approvalId);
+          // Create approval request
+          const approvalId = self.createPlanApprovalRequest(sessionKey);
 
-              // Wait for user approval via IPC
-              const approved = await this.waitForPlanApproval(approvalId);
+          // Notify slack-handler to show approval UI
+          await onPlanApprovalRequest(input.plan || 'No plan provided', approvalId);
 
-              this.logger.info('Plan approval result', { sessionKey, approved });
+          // Wait for user approval via IPC
+          const approved = await self.waitForPlanApproval(approvalId);
 
-              if (approved) {
-                return {
-                  hookSpecificOutput: {
-                    hookEventName: 'PreToolUse',
-                    permissionDecision: 'allow'
-                  }
-                };
-              } else {
-                return {
-                  hookSpecificOutput: {
-                    hookEventName: 'PreToolUse',
-                    permissionDecision: 'deny',
-                    permissionDecisionReason: 'User denied plan approval'
-                  }
-                };
-              }
-            }]
-          }]
+          self.logger.info('Plan approval result', { sessionKey, approved });
+
+          if (approved) {
+            return {
+              behavior: 'allow',
+              updatedInput: input
+            };
+          } else {
+            return {
+              behavior: 'deny',
+              message: 'User denied plan approval'
+            };
+          }
         };
 
-        this.logger.debug('Added ExitPlanMode hook for plan approval');
+        this.logger.debug('Added canUseTool for ExitPlanMode approval');
       }
     }
 

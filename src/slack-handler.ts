@@ -1085,6 +1085,7 @@ export class SlackHandler {
       // Determine which thread to post messages to
       let currentThreadTs = threadTs;
       let executionThreadTs: string | undefined;
+      let planModeExited = false;
 
       // If not using plan mode, create execution thread immediately
       if (!session.usePlanMode) {
@@ -1107,26 +1108,24 @@ export class SlackHandler {
       }
 
       // Create plan approval request handler
+      // This is called when ExitPlanMode is intercepted by canUseTool
+      // It shows the approval UI and waits for user response
+      // If approved, creates execution thread and updates currentThreadTs
       const onPlanApprovalRequest = async (plan: string, approvalId: string) => {
         this.logger.info('Plan approval requested', { threadTs, approvalId, planLength: plan.length });
 
-        // Truncate plan if too long for Slack
-        const maxPlanLength = 2500;
-        const displayPlan = plan.length > maxPlanLength
-          ? plan.substring(0, maxPlanLength) + '\n\n... (truncated)'
-          : plan;
-
+        // Show plan approval UI in main thread
         await this.app.client.chat.postMessage({
           token: config.slack.botToken,
           channel: channel,
           thread_ts: threadTs,
-          text: `📋 *Plan Ready for Review*\n\n${displayPlan}\n\n*Do you want to execute this plan?*`,
+          text: `📋 *Plan Ready for Review*\n\n${plan}\n\n*Do you want to execute this plan?*`,
           blocks: [
             {
               type: 'section',
               text: {
                 type: 'mrkdwn',
-                text: `📋 *Plan Ready for Review*\n\n\`\`\`\n${displayPlan}\n\`\`\``
+                text: `📋 *Plan Ready for Review*`
               }
             },
             {
@@ -1145,7 +1144,7 @@ export class SlackHandler {
                     type: 'plain_text',
                     text: '✅ Approve & Execute'
                   },
-                  value: approvalId,
+                  value: JSON.stringify({ approvalId, channel, threadTs }),
                   action_id: 'approve_plan',
                   style: 'primary'
                 },
@@ -1155,7 +1154,7 @@ export class SlackHandler {
                     type: 'plain_text',
                     text: '❌ Deny'
                   },
-                  value: approvalId,
+                  value: JSON.stringify({ approvalId, channel, threadTs }),
                   action_id: 'deny_plan',
                   style: 'danger'
                 }
@@ -1163,6 +1162,10 @@ export class SlackHandler {
             }
           ]
         });
+
+        // Note: The actual approval wait happens in canUseTool via IPC
+        // After canUseTool returns 'allow', we need to create execution thread
+        // This is handled by detecting ExitPlanMode tool result below
       };
 
       for await (const message of this.claudeHandler.streamQuery(
@@ -1182,29 +1185,38 @@ export class SlackHandler {
           message: message,
         });
 
-        // Check if plan mode has exited
-        if (message.type === 'system' && (message as any).subtype === 'plan_exit') {
-          this.logger.info('Plan mode exited, creating execution thread', { threadTs });
+        // Check if this is a tool_result message for ExitPlanMode (indicates plan was approved)
+        if (message.type === 'user' && (message as any).message?.content) {
+          const toolResults = (message as any).message.content.filter((part: any) => part.type === 'tool_result');
+          for (const toolResult of toolResults) {
+            // Check if this is ExitPlanMode result by looking at the content
+            if (toolResult.content && typeof toolResult.content === 'string' &&
+                toolResult.content.includes('exited plan mode')) {
+              if (!planModeExited && session?.inPlanMode) {
+                this.logger.info('ExitPlanMode completed, creating execution thread', { threadTs });
 
-          // Create a new thread for execution
-          const sessionName = this.tmuxManager.getSession(channel, threadTs);
-          const executionMessage = await this.app.client.chat.postMessage({
-            token: config.slack.botToken,
-            channel: channel,
-            text: `🚀 *Executing Plan: ${sessionName}*\n\nThis thread contains the execution output.`,
-          });
+                // Create a new thread for execution
+                const sessionName = this.tmuxManager.getSession(channel, threadTs);
+                const executionMessage = await this.app.client.chat.postMessage({
+                  token: config.slack.botToken,
+                  channel: channel,
+                  text: `🚀 *Executing Plan: ${sessionName}*\n\nThis thread contains the execution output.`,
+                });
 
-          executionThreadTs = executionMessage.ts as string;
-          currentThreadTs = executionThreadTs;
+                executionThreadTs = executionMessage.ts as string;
+                currentThreadTs = executionThreadTs;
+                planModeExited = true;
 
-          // Store execution thread in session
-          if (session) {
-            session.executionThreadTs = executionThreadTs;
-            session.inPlanMode = false;
+                // Store execution thread in session
+                if (session) {
+                  session.executionThreadTs = executionThreadTs;
+                  session.inPlanMode = false;
+                }
+
+                this.logger.info('Created execution thread after plan approval', { executionThreadTs });
+              }
+            }
           }
-
-          this.logger.info('Created execution thread', { executionThreadTs });
-          continue; // Skip processing this message
         }
 
         if (message.type === 'assistant') {
@@ -1212,6 +1224,18 @@ export class SlackHandler {
           const hasToolUse = message.message.content?.some((part: any) => part.type === 'tool_use');
 
           if (hasToolUse) {
+            // Check for ExitPlanMode tool - if we see this, plan approval is in progress
+            const exitPlanModeTool = message.message.content?.find((part: any) =>
+              part.type === 'tool_use' && part.name === 'ExitPlanMode'
+            );
+
+            if (exitPlanModeTool && session?.inPlanMode) {
+              this.logger.info('ExitPlanMode tool detected, waiting for approval', { threadTs });
+              // The plan will be shown via onPlanApprovalRequest callback
+              // Don't show this tool use in the output
+              continue;
+            }
+
             // Update status to show working
             if (statusMessageTs) {
               await this.app.client.chat.update({
@@ -1304,8 +1328,8 @@ export class SlackHandler {
         executionThreadTs,
       });
 
-      // Check if we need to summarize (use execution thread if it was created)
-      await this.checkAndSummarize(user, channel, executionThreadTs || threadTs);
+      // NOTE: Summarization disabled - user wants full output in main thread
+      // await this.checkAndSummarize(user, channel, executionThreadTs || threadTs);
 
       // Clean up temporary files
       if (processedFiles.length > 0) {
@@ -1692,31 +1716,49 @@ export class SlackHandler {
     // Handle plan approval button clicks
     this.app.action('approve_plan', async ({ ack, body, respond }) => {
       await ack();
-      const approvalId = (body as any).actions[0].value;
-      this.logger.info('Plan approved', { approvalId });
+      try {
+        const data = JSON.parse((body as any).actions[0].value);
+        const { approvalId } = data;
+        this.logger.info('Plan approved', { approvalId });
 
-      // Write approval response via IPC so the hook can read it
-      ClaudeHandler.writePlanApprovalResponse(approvalId, true);
+        // Write approval response via IPC so canUseTool can read it
+        ClaudeHandler.writePlanApprovalResponse(approvalId, true);
 
-      await respond({
-        response_type: 'ephemeral',
-        text: '✅ Plan approved - executing...'
-      });
+        await respond({
+          response_type: 'ephemeral',
+          text: '✅ Plan approved - executing...'
+        });
+      } catch (error) {
+        this.logger.error('Failed to parse plan approval data', error);
+        await respond({
+          response_type: 'ephemeral',
+          text: '❌ Error processing approval'
+        });
+      }
     });
 
     // Handle plan denial button clicks
     this.app.action('deny_plan', async ({ ack, body, respond }) => {
       await ack();
-      const approvalId = (body as any).actions[0].value;
-      this.logger.info('Plan denied', { approvalId });
+      try {
+        const data = JSON.parse((body as any).actions[0].value);
+        const { approvalId } = data;
+        this.logger.info('Plan denied', { approvalId });
 
-      // Write denial response via IPC so the hook can read it
-      ClaudeHandler.writePlanApprovalResponse(approvalId, false);
+        // Write denial response via IPC so canUseTool can read it
+        ClaudeHandler.writePlanApprovalResponse(approvalId, false);
 
-      await respond({
-        response_type: 'ephemeral',
-        text: '❌ Plan denied'
-      });
+        await respond({
+          response_type: 'ephemeral',
+          text: '❌ Plan denied'
+        });
+      } catch (error) {
+        this.logger.error('Failed to parse plan denial data', error);
+        await respond({
+          response_type: 'ephemeral',
+          text: '❌ Error processing denial'
+        });
+      }
     });
 
     // Handle project selection button clicks
