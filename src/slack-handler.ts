@@ -1106,13 +1106,73 @@ export class SlackHandler {
         this.logger.info('Created execution thread for non-plan mode', { executionThreadTs });
       }
 
+      // Create plan approval request handler
+      const onPlanApprovalRequest = async (plan: string, approvalId: string) => {
+        this.logger.info('Plan approval requested', { threadTs, approvalId, planLength: plan.length });
+
+        // Truncate plan if too long for Slack
+        const maxPlanLength = 2500;
+        const displayPlan = plan.length > maxPlanLength
+          ? plan.substring(0, maxPlanLength) + '\n\n... (truncated)'
+          : plan;
+
+        await this.app.client.chat.postMessage({
+          token: config.slack.botToken,
+          channel: channel,
+          thread_ts: threadTs,
+          text: `📋 *Plan Ready for Review*\n\n${displayPlan}\n\n*Do you want to execute this plan?*`,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: `📋 *Plan Ready for Review*\n\n\`\`\`\n${displayPlan}\n\`\`\``
+              }
+            },
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: '*Do you want to execute this plan?*'
+              }
+            },
+            {
+              type: 'actions',
+              elements: [
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '✅ Approve & Execute'
+                  },
+                  value: approvalId,
+                  action_id: 'approve_plan',
+                  style: 'primary'
+                },
+                {
+                  type: 'button',
+                  text: {
+                    type: 'plain_text',
+                    text: '❌ Deny'
+                  },
+                  value: approvalId,
+                  action_id: 'deny_plan',
+                  style: 'danger'
+                }
+              ]
+            }
+          ]
+        });
+      };
+
       for await (const message of this.claudeHandler.streamQuery(
         finalPrompt,
         session,
         abortController,
         workingDirectory,
         slackContext,
-        session.inPlanMode
+        session.inPlanMode,
+        session.inPlanMode ? onPlanApprovalRequest : undefined
       )) {
         if (abortController.signal.aborted) break;
 
@@ -1626,6 +1686,36 @@ export class SlackHandler {
       await respond({
         response_type: 'ephemeral',
         text: '❌ Tool execution denied'
+      });
+    });
+
+    // Handle plan approval button clicks
+    this.app.action('approve_plan', async ({ ack, body, respond }) => {
+      await ack();
+      const approvalId = (body as any).actions[0].value;
+      this.logger.info('Plan approved', { approvalId });
+
+      // Write approval response via IPC so the hook can read it
+      ClaudeHandler.writePlanApprovalResponse(approvalId, true);
+
+      await respond({
+        response_type: 'ephemeral',
+        text: '✅ Plan approved - executing...'
+      });
+    });
+
+    // Handle plan denial button clicks
+    this.app.action('deny_plan', async ({ ack, body, respond }) => {
+      await ack();
+      const approvalId = (body as any).actions[0].value;
+      this.logger.info('Plan denied', { approvalId });
+
+      // Write denial response via IPC so the hook can read it
+      ClaudeHandler.writePlanApprovalResponse(approvalId, false);
+
+      await respond({
+        response_type: 'ephemeral',
+        text: '❌ Plan denied'
       });
     });
 

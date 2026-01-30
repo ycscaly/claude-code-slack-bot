@@ -3,14 +3,73 @@ import { ConversationSession } from './types';
 import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
 import * as path from 'path';
+import * as fs from 'fs';
+
+// IPC directory for plan approval
+const PLAN_APPROVAL_DIR = '/tmp/claude-slack-bot-plan-approval';
+
+// Ensure IPC directory exists
+if (!fs.existsSync(PLAN_APPROVAL_DIR)) {
+  fs.mkdirSync(PLAN_APPROVAL_DIR, { recursive: true });
+}
 
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession> = new Map();
   private logger = new Logger('ClaudeHandler');
   private mcpManager: McpManager;
+  private pendingPlanApprovals: Map<string, { resolve: (approved: boolean) => void }> = new Map();
 
   constructor(mcpManager: McpManager) {
     this.mcpManager = mcpManager;
+  }
+
+  // Static methods for IPC-based plan approval (used by slack-handler)
+  static writePlanApprovalResponse(approvalId: string, approved: boolean): void {
+    const responsePath = path.join(PLAN_APPROVAL_DIR, `${approvalId}.response`);
+    fs.writeFileSync(responsePath, approved ? 'approved' : 'denied');
+  }
+
+  static hasPendingPlanApproval(sessionKey: string): boolean {
+    const pendingPath = path.join(PLAN_APPROVAL_DIR, `${sessionKey}.pending`);
+    return fs.existsSync(pendingPath);
+  }
+
+  // Create a pending plan approval request
+  createPlanApprovalRequest(sessionKey: string): string {
+    const approvalId = `plan-${sessionKey}-${Date.now()}`;
+    const pendingPath = path.join(PLAN_APPROVAL_DIR, `${approvalId}.pending`);
+    fs.writeFileSync(pendingPath, sessionKey);
+    return approvalId;
+  }
+
+  // Wait for plan approval response via IPC
+  async waitForPlanApproval(approvalId: string, timeoutMs: number = 300000): Promise<boolean> {
+    const responsePath = path.join(PLAN_APPROVAL_DIR, `${approvalId}.response`);
+    const pendingPath = path.join(PLAN_APPROVAL_DIR, `${approvalId}.pending`);
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeoutMs) {
+      if (fs.existsSync(responsePath)) {
+        const response = fs.readFileSync(responsePath, 'utf-8').trim();
+        // Cleanup
+        try {
+          fs.unlinkSync(responsePath);
+          fs.unlinkSync(pendingPath);
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+        return response === 'approved';
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    // Timeout - cleanup and deny
+    try {
+      fs.unlinkSync(pendingPath);
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+    return false;
   }
 
   getSessionKey(userId: string, channelId: string, threadTs?: string): string {
@@ -39,7 +98,8 @@ export class ClaudeHandler {
     abortController?: AbortController,
     workingDirectory?: string,
     slackContext?: { channel: string; threadTs?: string; user: string },
-    usePlanMode?: boolean
+    usePlanMode?: boolean,
+    onPlanApprovalRequest?: (plan: string, approvalId: string) => Promise<void>
   ): AsyncGenerator<SDKMessage, void, unknown> {
     // Determine if we should skip permissions
     const shouldSkipPermissions = session?.skipPermissions ?? true;
@@ -74,6 +134,53 @@ export class ClaudeHandler {
     if (usePlanMode) {
       options.planMode = true;
       this.logger.debug('Plan mode enabled');
+
+      // Add hook to intercept ExitPlanMode tool for user approval
+      if (slackContext && onPlanApprovalRequest) {
+        const sessionKey = session ? this.getSessionKey(session.userId, session.channelId, session.threadTs) : 'unknown';
+
+        options.hooks = {
+          PreToolUse: [{
+            matcher: 'ExitPlanMode',
+            hooks: [async (input: any, toolUseId: string | undefined, hookOptions: { signal: AbortSignal }) => {
+              this.logger.info('ExitPlanMode tool intercepted, requesting user approval', {
+                sessionKey,
+                plan: input.plan?.substring(0, 200)
+              });
+
+              // Create approval request
+              const approvalId = this.createPlanApprovalRequest(sessionKey);
+
+              // Notify slack-handler to show approval UI
+              await onPlanApprovalRequest(input.plan || 'No plan provided', approvalId);
+
+              // Wait for user approval via IPC
+              const approved = await this.waitForPlanApproval(approvalId);
+
+              this.logger.info('Plan approval result', { sessionKey, approved });
+
+              if (approved) {
+                return {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'allow'
+                  }
+                };
+              } else {
+                return {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: 'User denied plan approval'
+                  }
+                };
+              }
+            }]
+          }]
+        };
+
+        this.logger.debug('Added ExitPlanMode hook for plan approval');
+      }
     }
 
     // Add MCP server configuration if available
