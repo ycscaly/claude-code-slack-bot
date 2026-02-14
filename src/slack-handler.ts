@@ -1114,53 +1114,88 @@ export class SlackHandler {
       const onPlanApprovalRequest = async (plan: string, approvalId: string) => {
         this.logger.info('Plan approval requested', { threadTs, approvalId, planLength: plan.length });
 
+        // Slack has a 3000 char limit per block, so split long plans into multiple blocks
+        const maxBlockLength = 2900;
+        const planBlocks: any[] = [];
+
+        // Add header
+        planBlocks.push({
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `📋 *Plan Ready for Review*`
+          }
+        });
+
+        // Split plan into chunks if needed
+        if (plan.length <= maxBlockLength) {
+          planBlocks.push({
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: plan
+            }
+          });
+        } else {
+          // Split into multiple blocks
+          let remaining = plan;
+          while (remaining.length > 0) {
+            const chunk = remaining.substring(0, maxBlockLength);
+            remaining = remaining.substring(maxBlockLength);
+            planBlocks.push({
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: chunk
+              }
+            });
+          }
+        }
+
+        // Add divider and approval question
+        planBlocks.push({ type: 'divider' });
+        planBlocks.push({
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: '*Do you want to execute this plan?*'
+          }
+        });
+
+        // Add action buttons
+        planBlocks.push({
+          type: 'actions',
+          elements: [
+            {
+              type: 'button',
+              text: {
+                type: 'plain_text',
+                text: '✅ Approve & Execute'
+              },
+              value: JSON.stringify({ approvalId, channel, threadTs }),
+              action_id: 'approve_plan',
+              style: 'primary'
+            },
+            {
+              type: 'button',
+              text: {
+                type: 'plain_text',
+                text: '❌ Deny'
+              },
+              value: JSON.stringify({ approvalId, channel, threadTs }),
+              action_id: 'deny_plan',
+              style: 'danger'
+            }
+          ]
+        });
+
         // Show plan approval UI in main thread
         await this.app.client.chat.postMessage({
           token: config.slack.botToken,
           channel: channel,
           thread_ts: threadTs,
           text: `📋 *Plan Ready for Review*\n\n${plan}\n\n*Do you want to execute this plan?*`,
-          blocks: [
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `📋 *Plan Ready for Review*`
-              }
-            },
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: '*Do you want to execute this plan?*'
-              }
-            },
-            {
-              type: 'actions',
-              elements: [
-                {
-                  type: 'button',
-                  text: {
-                    type: 'plain_text',
-                    text: '✅ Approve & Execute'
-                  },
-                  value: JSON.stringify({ approvalId, channel, threadTs }),
-                  action_id: 'approve_plan',
-                  style: 'primary'
-                },
-                {
-                  type: 'button',
-                  text: {
-                    type: 'plain_text',
-                    text: '❌ Deny'
-                  },
-                  value: JSON.stringify({ approvalId, channel, threadTs }),
-                  action_id: 'deny_plan',
-                  style: 'danger'
-                }
-              ]
-            }
-          ]
+          blocks: planBlocks
         });
 
         // Note: The actual approval wait happens in canUseTool via IPC
