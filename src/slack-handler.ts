@@ -1118,12 +1118,12 @@ export class SlackHandler {
         const maxBlockLength = 2900;
         const planBlocks: any[] = [];
 
-        // Add header
+        // Add header with COMPLETED for notification filtering
         planBlocks.push({
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `📋 *Plan Ready for Review*`
+            text: `COMPLETED 📋 *Plan Ready for Review*`
           }
         });
 
@@ -1194,7 +1194,7 @@ export class SlackHandler {
           token: config.slack.botToken,
           channel: channel,
           thread_ts: threadTs,
-          text: `📋 *Plan Ready for Review*\n\n${plan}\n\n*Do you want to execute this plan?*`,
+          text: `COMPLETED 📋 *Plan Ready for Review*\n\n${plan}\n\n*Do you want to execute this plan?*`,
           blocks: planBlocks
         });
 
