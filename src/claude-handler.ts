@@ -108,18 +108,6 @@ export class ClaudeHandler {
       outputFormat: 'stream-json',
     };
 
-    // Only set permissionMode when bypassing - otherwise let permissionPromptToolName handle it
-    if (shouldSkipPermissions) {
-      options.permissionMode = 'bypassPermissions';
-    }
-
-    this.logger.debug('Permission configuration', {
-      skipPermissions: session?.skipPermissions,
-      shouldSkipPermissions,
-      permissionMode: options.permissionMode || 'custom',
-      willUseCustomPrompt: !shouldSkipPermissions && !!slackContext,
-    });
-
     if (workingDirectory) {
       options.cwd = workingDirectory;
     }
@@ -130,60 +118,81 @@ export class ClaudeHandler {
       this.logger.debug('Using profile', { profile: options.profile });
     }
 
-    // Add plan mode if requested
-    if (usePlanMode) {
+    // Handle plan mode - requires canUseTool to intercept ExitPlanMode
+    // IMPORTANT: Cannot use bypassPermissions with plan mode because it bypasses canUseTool
+    if (usePlanMode && slackContext && onPlanApprovalRequest) {
       options.planMode = true;
-      this.logger.debug('Plan mode enabled');
+      this.logger.debug('Plan mode enabled with ExitPlanMode approval');
+
+      const sessionKey = session ? this.getSessionKey(session.userId, session.channelId, session.threadTs) : 'unknown';
+      const self = this;
 
       // Use canUseTool to intercept ExitPlanMode for user approval
-      if (slackContext && onPlanApprovalRequest) {
-        const sessionKey = session ? this.getSessionKey(session.userId, session.channelId, session.threadTs) : 'unknown';
-        const self = this;
+      // All other tools are auto-allowed (like bypassPermissions but selective)
+      options.canUseTool = async (
+        toolName: string,
+        input: any,
+        toolOptions: { signal: AbortSignal; suggestions?: any[] }
+      ) => {
+        // Allow all tools except ExitPlanMode
+        if (toolName !== 'ExitPlanMode') {
+          return {
+            behavior: 'allow',
+            updatedInput: input
+          };
+        }
 
-        options.canUseTool = async (
-          toolName: string,
-          input: any,
-          toolOptions: { signal: AbortSignal; suggestions?: any[] }
-        ) => {
-          // Only intercept ExitPlanMode
-          if (toolName !== 'ExitPlanMode') {
-            return {
-              behavior: 'allow',
-              updatedInput: input
-            };
-          }
+        self.logger.info('ExitPlanMode tool intercepted via canUseTool, requesting user approval', {
+          sessionKey,
+          plan: input.plan?.substring(0, 200)
+        });
 
-          self.logger.info('ExitPlanMode tool intercepted via canUseTool, requesting user approval', {
-            sessionKey,
-            plan: input.plan?.substring(0, 200)
-          });
+        // Create approval request
+        const approvalId = self.createPlanApprovalRequest(sessionKey);
 
-          // Create approval request
-          const approvalId = self.createPlanApprovalRequest(sessionKey);
+        // Notify slack-handler to show approval UI
+        await onPlanApprovalRequest(input.plan || 'No plan provided', approvalId);
 
-          // Notify slack-handler to show approval UI
-          await onPlanApprovalRequest(input.plan || 'No plan provided', approvalId);
+        // Wait for user approval via IPC
+        const approved = await self.waitForPlanApproval(approvalId);
 
-          // Wait for user approval via IPC
-          const approved = await self.waitForPlanApproval(approvalId);
+        self.logger.info('Plan approval result', { sessionKey, approved });
 
-          self.logger.info('Plan approval result', { sessionKey, approved });
+        if (approved) {
+          return {
+            behavior: 'allow',
+            updatedInput: input
+          };
+        } else {
+          return {
+            behavior: 'deny',
+            message: 'User denied plan approval'
+          };
+        }
+      };
 
-          if (approved) {
-            return {
-              behavior: 'allow',
-              updatedInput: input
-            };
-          } else {
-            return {
-              behavior: 'deny',
-              message: 'User denied plan approval'
-            };
-          }
-        };
-
-        this.logger.debug('Added canUseTool for ExitPlanMode approval');
+      this.logger.debug('Permission configuration for plan mode', {
+        skipPermissions: session?.skipPermissions,
+        usingCanUseTool: true,
+        planMode: true,
+      });
+    } else if (usePlanMode) {
+      // Plan mode without approval callback - just enable plan mode with bypass
+      options.planMode = true;
+      if (shouldSkipPermissions) {
+        options.permissionMode = 'bypassPermissions';
       }
+      this.logger.debug('Plan mode enabled without approval callback');
+    } else {
+      // Non-plan mode - use normal permission handling
+      if (shouldSkipPermissions) {
+        options.permissionMode = 'bypassPermissions';
+      }
+      this.logger.debug('Permission configuration', {
+        skipPermissions: session?.skipPermissions,
+        shouldSkipPermissions,
+        permissionMode: options.permissionMode || 'default',
+      });
     }
 
     // Add MCP server configuration if available
