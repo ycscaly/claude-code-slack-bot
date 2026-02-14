@@ -119,9 +119,10 @@ export class ClaudeHandler {
     }
 
     // Handle plan mode - requires canUseTool to intercept ExitPlanMode
-    // IMPORTANT: Cannot use bypassPermissions with plan mode because it bypasses canUseTool
+    // IMPORTANT: Use permissionMode: 'plan' (not planMode which is not a valid SDK option)
+    // permissionMode: 'plan' enables plan mode AND ensures canUseTool is called for all tools
     if (usePlanMode && slackContext && onPlanApprovalRequest) {
-      options.planMode = true;
+      options.permissionMode = 'plan';
       this.logger.debug('Plan mode enabled with ExitPlanMode approval');
 
       const sessionKey = session ? this.getSessionKey(session.userId, session.channelId, session.threadTs) : 'unknown';
@@ -177,11 +178,9 @@ export class ClaudeHandler {
         planMode: true,
       });
     } else if (usePlanMode) {
-      // Plan mode without approval callback - just enable plan mode with bypass
-      options.planMode = true;
-      if (shouldSkipPermissions) {
-        options.permissionMode = 'bypassPermissions';
-      }
+      // Plan mode without approval callback - use plan permission mode
+      // Note: permissionMode: 'plan' is the correct way to enable plan mode
+      options.permissionMode = 'plan';
       this.logger.debug('Plan mode enabled without approval callback');
     } else {
       // Non-plan mode - use normal permission handling
