@@ -119,11 +119,39 @@ export class ClaudeHandler {
     }
 
     // Handle plan mode - requires canUseTool to intercept ExitPlanMode
-    // IMPORTANT: Use permissionMode: 'plan' (not planMode which is not a valid SDK option)
-    // permissionMode: 'plan' enables plan mode AND ensures canUseTool is called for all tools
+    // IMPORTANT: permissionMode: 'plan' only affects permission handling, NOT Claude's behavior
+    // We MUST add a system prompt telling Claude it's in plan mode and should create a plan
     if (usePlanMode && slackContext && onPlanApprovalRequest) {
       options.permissionMode = 'plan';
-      this.logger.debug('Plan mode enabled with ExitPlanMode approval');
+
+      // CRITICAL: The SDK's permissionMode: 'plan' does NOT tell Claude to plan!
+      // We must add a system prompt with plan mode instructions
+      options.appendSystemPrompt = `
+You are currently in PLAN MODE. This is a critical workflow state that changes how you should work:
+
+## Plan Mode Rules:
+1. **DO NOT** execute any tools that modify files, run commands, or make changes yet
+2. **DO** use read-only tools (Read, Glob, Grep, Task with Explore agent) to understand the codebase
+3. **CREATE** a detailed, step-by-step implementation plan
+4. **CALL** the ExitPlanMode tool when your plan is ready, passing your plan as the argument
+
+## Plan Format:
+Your plan should include:
+- Summary of what will be done
+- Files that will be created/modified
+- Step-by-step implementation approach
+- Any risks or considerations
+
+## Important:
+- The plan will be shown to the user for approval
+- Only after approval will execution begin in a separate thread
+- Until then, ONLY plan - do not execute any changes
+
+When you have gathered enough information and created your plan, call:
+ExitPlanMode({ plan: "your detailed plan here" })
+`;
+
+      this.logger.debug('Plan mode enabled with system prompt and ExitPlanMode approval');
 
       const sessionKey = session ? this.getSessionKey(session.userId, session.channelId, session.threadTs) : 'unknown';
       const self = this;
@@ -178,9 +206,17 @@ export class ClaudeHandler {
         planMode: true,
       });
     } else if (usePlanMode) {
-      // Plan mode without approval callback - use plan permission mode
-      // Note: permissionMode: 'plan' is the correct way to enable plan mode
+      // Plan mode without approval callback - still need system prompt
       options.permissionMode = 'plan';
+      options.appendSystemPrompt = `
+You are currently in PLAN MODE. Create a detailed implementation plan before executing:
+
+1. Use read-only tools (Read, Glob, Grep) to understand the codebase
+2. Create a step-by-step plan
+3. Call ExitPlanMode with your plan when ready
+
+Do not execute changes until the plan is approved via ExitPlanMode.
+`;
       this.logger.debug('Plan mode enabled without approval callback');
     } else {
       // Non-plan mode - use normal permission handling
