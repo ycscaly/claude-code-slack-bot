@@ -1240,8 +1240,10 @@ export class SlackHandler {
           const toolResults = (message as any).message.content.filter((part: any) => part.type === 'tool_result');
           for (const toolResult of toolResults) {
             // Check if this is ExitPlanMode result by looking at the content
+            // The SDK returns "User has approved your plan" when ExitPlanMode is allowed
             if (toolResult.content && typeof toolResult.content === 'string' &&
-                toolResult.content.includes('exited plan mode')) {
+                (toolResult.content.includes('exited plan mode') ||
+                 toolResult.content.includes('approved your plan'))) {
               if (!planModeExited && session?.inPlanMode) {
                 this.logger.info('ExitPlanMode completed, creating execution thread', { threadTs });
 
