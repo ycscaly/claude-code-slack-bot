@@ -1042,10 +1042,15 @@ export class SlackHandler {
 
     let session = this.claudeHandler.getSession(user, channel, threadTs);
     if (!session) {
-      this.logger.debug('Creating new session', { sessionKey });
+      this.logger.info('PLAN_MODE_DEBUG: Creating NEW session (plan mode will be lost!)', { sessionKey });
       session = this.claudeHandler.createSession(user, channel, threadTs);
     } else {
-      this.logger.debug('Using existing session', { sessionKey, sessionId: session.sessionId });
+      this.logger.info('PLAN_MODE_DEBUG: Retrieved existing session', {
+        sessionKey,
+        sessionId: session.sessionId,
+        inPlanMode: session.inPlanMode,
+        usePlanMode: session.usePlanMode,
+      });
     }
 
     let currentMessages: string[] = [];
@@ -1202,6 +1207,16 @@ export class SlackHandler {
         // After canUseTool returns 'allow', we need to create execution thread
         // This is handled by detecting ExitPlanMode tool result below
       };
+
+      // DEBUG: Log plan mode state before calling streamQuery
+      this.logger.info('PLAN_MODE_DEBUG: About to call streamQuery', {
+        sessionKey: this.claudeHandler.getSessionKey(user, channel, threadTs),
+        sessionExists: !!session,
+        sessionInPlanMode: session?.inPlanMode,
+        sessionUsePlanMode: session?.usePlanMode,
+        hasOnPlanApprovalRequest: !!(session?.inPlanMode ? onPlanApprovalRequest : undefined),
+        slackContextExists: !!slackContext,
+      });
 
       for await (const message of this.claudeHandler.streamQuery(
         finalPrompt,
@@ -2195,6 +2210,14 @@ export class SlackHandler {
         // Check if there's a pending message to process
         const threadKey = `${channel}-${threadTs}`;
         const pendingMessage = this.pendingThreadMessages.get(threadKey);
+
+        this.logger.info('PLAN_MODE_DEBUG: After setting plan mode, checking pending message', {
+          threadKey,
+          hasPendingMessage: !!pendingMessage,
+          sessionKey: this.claudeHandler.getSessionKey(user, channel, threadTs),
+          sessionInPlanMode: session.inPlanMode,
+        });
+
         if (pendingMessage) {
           this.pendingThreadMessages.delete(threadKey);
 

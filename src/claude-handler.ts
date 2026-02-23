@@ -118,6 +118,14 @@ export class ClaudeHandler {
       this.logger.debug('Using profile', { profile: options.profile });
     }
 
+    // DEBUG: Log plan mode parameters received
+    this.logger.info('PLAN_MODE_DEBUG: streamQuery received', {
+      usePlanMode,
+      hasSlackContext: !!slackContext,
+      hasOnPlanApprovalRequest: !!onPlanApprovalRequest,
+      willEnablePlanMode: !!(usePlanMode && slackContext && onPlanApprovalRequest),
+    });
+
     // Handle plan mode - requires canUseTool to intercept ExitPlanMode
     // IMPORTANT: permissionMode: 'plan' only affects permission handling, NOT Claude's behavior
     // We MUST add a system prompt telling Claude it's in plan mode and should create a plan
